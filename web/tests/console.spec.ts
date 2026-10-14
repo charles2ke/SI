@@ -4,6 +4,7 @@ import { Api, streamChat } from "../src/lib/api";
 async function connect(page: Page) {
   await page.goto("/");
   await page.getByRole("button", { name: "Use local dev key" }).click();
+  expect(await page.evaluate(() => ({ local: Object.keys(localStorage), session: Object.keys(sessionStorage) }))).toEqual({ local: [], session: [] });
 }
 async function mock(page: Page, handler?: (path: string, method: string, body: Record<string, unknown> | null) => unknown) {
   await page.route("http://localhost:8000/**", async route => {
@@ -37,6 +38,9 @@ test("connect, stream chat, and render responsive workspace", async ({ page }, t
   await expect(page.getByRole("button", { name: "Send message" })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("console-mobile.png"), fullPage: true });
+  await page.reload();
+  await expect(page.getByText("Your workspace is ready")).toBeVisible();
+  await expect(page.getByLabel("API key", { exact: true })).toHaveValue("");
 });
 
 test("API and streaming errors surface accessibly", async ({ page }) => {

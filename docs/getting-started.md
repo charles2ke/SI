@@ -73,6 +73,20 @@ Schema references and regex keywords may be restricted to prevent remote fetchin
 or unbounded validation; use simple inline schemas.
 The CLI exits nonzero below threshold or on execution errors.
 
+## Memory
+
+Agent runs with a `session_id` persist conversation turns. To add project-wide
+long-term context, use `POST /v1/memory`:
+
+```json
+{"session_id":"preferences","content":"Prefer concise answers.","long_term":true}
+```
+
+`GET /v1/memory?session_id=SESSION` returns recent session turns plus that project's
+long-term entries. Memory never crosses the authenticated project's boundary.
+Writes apply guardrails and record an audit action; viewers cannot write.
+Long-term memory is shared within a project, not private to an individual API key.
+
 ## Approvals and outbound tools
 
 Only allow public hosts you trust with `HTTP_ALLOWED_HOSTS`. Sensitive HTTP, Python

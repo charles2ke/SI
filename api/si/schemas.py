@@ -21,6 +21,13 @@ class Search(Input):
     limit: int = Field(default=5, ge=1, le=50)
 
 
+class MemoryCreate(Input):
+    session_id: str = Field(min_length=1, max_length=200)
+    content: str = Field(min_length=1, max_length=100000)
+    role: Literal["user", "assistant"] = "user"
+    long_term: bool = False
+
+
 class AgentCreate(Input):
     name: str = Field(min_length=1, max_length=200)
     system_prompt: str = "You are a helpful assistant."
@@ -64,6 +71,7 @@ class EvalItem(Input):
 
 
 class EvalCreate(Input):
+    model: str = Field(default="mock", min_length=1, max_length=200)
     dataset: list[EvalItem] = Field(min_length=1, max_length=1000)
     scorer: Literal["exact_match", "contains", "regex", "json_schema", "llm_judge"]
     agent_id: str | None = None

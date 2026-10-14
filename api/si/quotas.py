@@ -1,6 +1,7 @@
 import calendar
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any
 
 from fastapi import HTTPException
@@ -10,6 +11,7 @@ from redis.exceptions import RedisError
 from si.config import settings
 
 
+@lru_cache(maxsize=1)
 def get_redis() -> Redis:
     return Redis.from_url(settings.redis_url, decode_responses=True)
 
@@ -34,6 +36,25 @@ redis.call('INCRBY', KEYS[1], ARGV[1])
 redis.call('INCRBYFLOAT', KEYS[2], ARGV[2])
 return 0
 """
+
+REQUEST_RATE = """
+if tonumber(redis.call('GET', KEYS[1]) or '0') >= tonumber(ARGV[1]) then return 1 end
+redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], 60)
+return 0
+"""
+
+
+async def check_request_rate(redis: Any, project_id: str) -> None:
+    minute = int(datetime.now(timezone.utc).timestamp()) // 60
+    try:
+        exceeded = await redis.eval(
+            REQUEST_RATE, 1, f"si:{{{project_id}}}:http-rate:{minute}", settings.rate_limit,
+        )
+    except RedisError as exc:
+        raise HTTPException(503, "Quota service unavailable") from exc
+    if exceeded:
+        raise HTTPException(429, "Rate limit exceeded")
 
 
 @dataclass

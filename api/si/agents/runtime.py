@@ -14,6 +14,8 @@ from si.tracing import record_span
 
 
 class ProjectGateway:
+    records_embedding_spans = True
+
     def __init__(self, session: Any, project_id: str, redis: Any = None, gateway: Any = None):
         self.session = session
         self.project_id = project_id
@@ -28,7 +30,7 @@ class ProjectGateway:
 
     async def chat(self, request: Any) -> Any:
         request = self.guard.check_request(request)
-        estimate = self.guard.tokens(json.dumps(request.model_dump(mode="json"))) + request.max_tokens
+        estimate = len(json.dumps(request.model_dump(mode="json")).encode()) + request.max_tokens
         reservation = await self._reserve(estimate)
         started = time.monotonic()
         # Unknown upstream failures retain reservations: usage may have accrued.
@@ -45,7 +47,7 @@ class ProjectGateway:
         return response
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        tokens = sum(self.guard.tokens(value) for value in texts)
+        tokens = sum(len(value.encode()) for value in texts)
         reservation = await self._reserve(tokens)
         started = time.monotonic()
         vectors = await self.gateway.embed(texts)

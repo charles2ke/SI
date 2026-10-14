@@ -26,7 +26,7 @@ from si.auth import audit, bootstrap, hash_key, issue_key, require_admin, requir
 from si.config import settings
 from si.db import APIKey, Agent, Collection, EvalRun, PromptVersion, Run, Span, engine, get_session, new_id
 from si.quotas import get_redis, reserve
-from si.schemas import AgentCreate, AgentPatch, Approval, CollectionCreate, EvalCreate, KeyCreate, PromptCreate, Render, RunCreate, Search
+from si.schemas import AgentCreate, AgentPatch, Approval, CollectionCreate, EvalCreate, KeyCreate, MemoryCreate, PromptCreate, Render, RunCreate, Search
 from si.tracing import record_span
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -36,7 +36,10 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 async def lifespan(app: FastAPI):
     await asyncio.to_thread(command.upgrade, Config(str(Path(__file__).parents[1] / "alembic.ini")), "head")
     await asyncio.to_thread(bootstrap)
-    yield
+    try:
+        yield
+    finally:
+        await get_redis().aclose()
 
 
 app = FastAPI(title="SI", version="0.1.0", lifespan=lifespan)
@@ -45,7 +48,7 @@ app.add_middleware(
     allow_origins=[origin.strip() for origin in
                    os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if origin.strip()],
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
-    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "Last-Event-ID"],
 )
 DB = Annotated[Session, Depends(get_session)]
 Key = Annotated[APIKey, Depends(require_key)]
@@ -56,7 +59,14 @@ RedisDep = Annotated[Any, Depends(get_redis)]
 @app.middleware("http")
 async def request_log(request: Request, call_next):
     started = time.perf_counter()
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    finally:
+        span = getattr(request.state, "trace_span", None)
+        if span is not None:
+            span.latency_ms = (time.perf_counter() - started) * 1000
+            span.outputs = {"status": getattr(locals().get("response"), "status_code", 500)}
+            request.state.trace_session.commit()
     logging.getLogger("si").info(json.dumps({
         "method": request.method, "path": request.url.path, "status": response.status_code,
         "latency_ms": round((time.perf_counter() - started) * 1000, 2)}))
@@ -210,7 +220,10 @@ async def chat(request: Request, session: DB, key: Key, redis: RedisDep):
         raise HTTPException(502, "Model request failed") from exc
     await reservation.reconcile(result.input_tokens + result.output_tokens, result.cost)
     record_span(session, key.project_id, "gateway", body.model,
-                outputs={"model": result.model}, latency_ms=(time.perf_counter() - started) * 1000,
+                inputs={"messages": [message.model_dump() for message in body.messages]},
+                outputs={"model": result.model, "content": result.content,
+                         "tool_calls": [call.model_dump() for call in result.tool_calls]},
+                latency_ms=(time.perf_counter() - started) * 1000,
                 tokens=result.input_tokens + result.output_tokens, cost=result.cost)
     audit(session, key, "chat.completions")
     session.commit()
@@ -307,6 +320,33 @@ async def search_collection(collection_id: str, body: Search, session: DB, key: 
 @app.get("/v1/agents")
 def agents(session: DB, key: Key):
     return list_owned(session, Agent, key.project_id)
+
+
+@app.get("/v1/memory")
+def memory(session_id: str, session: DB, key: Key):
+    from si.agents.memory import MemoryStore
+    try:
+        return [serialize(item) for item in MemoryStore(session).load(key.project_id, session_id)]
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/v1/memory", status_code=201)
+def remember(body: MemoryCreate, session: DB, key: Key):
+    from si.agents.memory import MemoryStore
+    from si.guardrails import GuardrailError, Guardrails
+    try:
+        guard = Guardrails()
+        item = MemoryStore(session).remember(
+            key.project_id, body.session_id, guard.post(guard.pre(body.content)),
+            body.role, body.long_term,
+        )
+    except (ValueError, GuardrailError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    session.flush()
+    audit(session, key, "memory.create", item.id)
+    session.commit()
+    return serialize(item)
 
 
 def check_collections(session: Session, project_id: str, ids: list[str]):

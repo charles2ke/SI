@@ -3,11 +3,21 @@ name = "si-platform"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-  "fastapi==0.119.0", "pydantic==2.12.3", "sqlalchemy==2.0.44",
-  "alembic==1.17.0", "psycopg[binary]==3.2.12", "pgvector==0.4.1",
-  "redis==5.2.1", "arq==0.26.3", "httpx==0.28.1",
-  "python-multipart==0.0.30", "pypdf==6.19.0", "beautifulsoup4==4.14.2",
-  "jsonschema==4.25.1", "uvicorn==0.38.0",
+  "fastapi==0.143.1",
+  "pydantic==2.12.3",
+  "sqlalchemy==2.0.44",
+  "alembic==1.17.0",
+  "psycopg[binary]==3.2.12",
+  "pgvector==0.4.1",
+  "redis==5.2.1",
+  "arq==0.26.3",
+  "httpx==0.28.1",
+  "python-multipart==0.0.30",
+  "pypdf==6.19.0",
+  "beautifulsoup4==4.14.2",
+  "jsonschema==4.25.1",
+  "uvicorn==0.38.0",
+  "starlette==1.8.0",
 ]
 
 [dependency-groups]
@@ -23,6 +33,7 @@ packages = ["si"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = [".."]
 
 [tool.ruff]
 target-version = "py312"

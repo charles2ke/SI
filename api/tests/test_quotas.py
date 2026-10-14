@@ -33,9 +33,11 @@ async def test_fail_closed():
     assert exc.value.status_code == 503
 
 
-@pytest.mark.skipif(not os.getenv("SI_TEST_REDIS_URL"), reason="Requires real Redis")
+@pytest.mark.skipif(not (os.getenv("SI_TEST_REDIS_URL") or os.getenv("REDIS_URL")),
+                    reason="Requires real Redis")
 async def test_real_redis_atomic_reservation():
-    redis = Redis.from_url(os.environ["SI_TEST_REDIS_URL"], decode_responses=True)
+    redis = Redis.from_url(os.getenv("SI_TEST_REDIS_URL") or os.environ["REDIS_URL"],
+                           decode_responses=True)
     reservation = await reserve(redis, str(uuid.uuid4()), 100, 0.1)
     await reservation.reconcile(12, 0.01)
     assert int(await redis.get(reservation.keys[1])) == 12

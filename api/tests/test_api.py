@@ -1,3 +1,15 @@
+def test_cors_allows_console_and_rejects_unknown_origins(client):
+    headers = {"Origin": "http://localhost:3000", "Access-Control-Request-Method": "POST",
+               "Access-Control-Request-Headers": "content-type,x-api-key,last-event-id"}
+    response = client.options("/v1/chat/completions", headers=headers)
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+    denied = client.options("/v1/chat/completions",
+                            headers={**headers, "Origin": "https://untrusted.example"})
+    assert denied.status_code == 400
+    assert "access-control-allow-origin" not in denied.headers
+
+
 def test_models_and_chat_stream(client):
     assert any(model["id"] == "mock" for model in client.get("/v1/models").json()["data"])
     body = {"model": "mock", "messages": [{"role": "user", "content": "Hello"}]}

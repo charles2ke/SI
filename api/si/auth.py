@@ -1,7 +1,7 @@
 import hashlib
 import logging
 import secrets
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException, Request
 from sqlalchemy import select
@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from si.config import settings
 from si.db import APIKey, Audit, Project, SessionLocal, get_session
+from si.quotas import check_request_rate, get_redis
 from si.tracing import record_span
 
 
@@ -33,17 +34,25 @@ def bootstrap() -> None:
             '{"event":"demo_bootstrap_credential","message":"Set SI_BOOTSTRAP_KEY before deployment"}')
 
 
-def require_key(request: Request, session: Annotated[Session, Depends(get_session)]) -> APIKey:
+async def require_key(
+    request: Request,
+    session: Annotated[Session, Depends(get_session)],
+    redis: Annotated[Any, Depends(get_redis)],
+) -> APIKey:
     header = request.headers.get("authorization", "")
     raw = header[7:] if header.lower().startswith("bearer ") else request.headers.get("x-api-key", "")
     key = session.scalar(select(APIKey).where(
         APIKey.key_hash == hash_key(raw), APIKey.revoked.is_(False)))
     if key is None:
         raise HTTPException(401, "Invalid API key", headers={"WWW-Authenticate": "Bearer"})
+    await check_request_rate(redis, key.project_id)
     if request.method not in {"GET", "HEAD", "OPTIONS"} and key.role == "viewer":
         raise HTTPException(403, "Viewer keys are read-only")
-    record_span(session, key.project_id, "request", request.method + " " + request.url.path)
+    span = record_span(session, key.project_id, "request", request.method + " " + request.url.path,
+                       inputs={"method": request.method, "path": request.url.path})
     session.commit()
+    request.state.trace_span = span
+    request.state.trace_session = session
     return key
 
 

@@ -169,9 +169,11 @@ async def evaluate(
     from si.db import Agent, EvalRun, PromptVersion, Run
 
     if isinstance(dataset, dict):
+        options = dict(dataset)
+        options.setdefault("model", model)
         return await evaluate(
             session, project_id, gateway=gateway, executor_factory=executor_factory,
-            before_call=before_call, after_call=after_call, model=model, redis=redis, **dataset,
+            before_call=before_call, after_call=after_call, redis=redis, **options,
         )
     if scorer not in SCORERS or not 0 <= threshold <= 1 or not 1 <= len(dataset) <= 1000:
         raise ValueError("Invalid scorer, threshold, or dataset size")

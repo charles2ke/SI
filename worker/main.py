@@ -1,3 +1,5 @@
+import asyncio
+
 from arq.connections import RedisSettings
 from sqlalchemy import select
 
@@ -12,7 +14,17 @@ async def execute_agent(ctx, run_id: str):
         run = session.get(Run, run_id)
         if run is None or run.status not in {"queued", "interrupted"}:
             return
-        await execute_run(session, run_id)
+        try:
+            await execute_run(session, run_id)
+        except asyncio.CancelledError:
+            session.rollback()
+            run = session.get(Run, run_id)
+            if run is not None and run.status in {"queued", "running"}:
+                run.status = "interrupted"
+                run.error = "Worker cancelled or timed out; inspect events before retrying"
+                run.events = [*(run.events or []), {"type": "interrupted", "data": run.error}]
+                session.commit()
+            raise
 
 
 async def startup(ctx):

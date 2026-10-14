@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import math
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,29 @@ class RAGService:
         self.gateway = gateway
         self.reranker = reranker
 
+    def _span(
+        self, project_id: str, kind: str, name: str, started: float,
+        inputs: dict[str, Any], outputs: dict[str, Any],
+    ) -> None:
+        from si.db import Span
+
+        self.session.add(
+            Span(
+                project_id=project_id, kind=kind, name=name, inputs=inputs, outputs=outputs,
+                latency_ms=(time.monotonic() - started) * 1000,
+            )
+        )
+
+    async def _embed(self, project_id: str, texts: list[str]) -> list[list[float]]:
+        started = time.monotonic()
+        vectors = await self.gateway.embed(texts)
+        if not getattr(self.gateway, "records_embedding_spans", False):
+            self._span(
+                project_id, "embedding", "rag_embedding", started,
+                {"count": len(texts)}, {"dimensions": 64, "count": len(vectors)},
+            )
+        return vectors
+
     def _collections(self, project_id: str, collection_ids: list[str]) -> None:
         from si.db import Collection
 
@@ -109,13 +133,14 @@ class RAGService:
     ) -> int:
         from si.db import Chunk
 
+        started = time.monotonic()
         self._collections(project_id, [collection_id])
         pieces = chunk_text(parse_document(filename, data))
         # Bound embedding batches, not one provider request per document.
         staged = []
         for start in range(0, len(pieces), 64):
             batch = pieces[start : start + 64]
-            vectors = await self.gateway.embed(batch)
+            vectors = await self._embed(project_id, batch)
             if len(vectors) != len(batch):
                 raise ValueError("Embedding count does not match input")
             for piece, vector in zip(batch, vectors, strict=True):
@@ -129,6 +154,10 @@ class RAGService:
                     )
                 )
         self.session.add_all(staged)
+        self._span(
+            project_id, "ingestion", filename[:200], started,
+            {"collection_id": collection_id, "bytes": len(data)}, {"chunks": len(staged)},
+        )
         self.session.commit()
         return len(staged)
 
@@ -154,12 +183,13 @@ class RAGService:
     ) -> list[dict[str, Any]]:
         from si.db import Chunk
 
+        started = time.monotonic()
         if not 1 <= limit <= 100 or not query.strip() or len(query) > 20_000:
             raise ValueError("Invalid search query or limit")
         self._collections(project_id, collection_ids)
         if not collection_ids:
             return []
-        vectors = await self.gateway.embed([query])
+        vectors = await self._embed(project_id, [query])
         if len(vectors) != 1:
             raise ValueError("Expected one query embedding")
         vector = vectors[0]
@@ -232,7 +262,14 @@ class RAGService:
         ]
         if self.reranker:
             results = self.reranker(query, results)
-        return results[:limit]
+        results = results[:limit]
+        self._span(
+            project_id, "retrieval", "hybrid_search", started,
+            {"collection_ids": collection_ids, "query": query, "limit": limit},
+            {"matches": [{"id": row["id"], "score": row["score"]} for row in results]},
+        )
+        self.session.commit()
+        return results
 
 
 async def ingest(

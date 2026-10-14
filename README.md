@@ -121,6 +121,8 @@ The public chat API buffers a completion before sending SSE chunks so post-gener
 guardrails and accounting finish before emission; the gateway also exposes upstream
 streaming for integrations that can safely apply incremental policies.
 Model policy metadata and USD prices are estimates, not billing statements.
+HTTP requests and model calls each have a project-scoped minute limit; token/cost
+budgets are reserved for model work, not ordinary reads.
 Provider credentials stay on the backend; the console uses only the project API key.
 
 ## Extension points

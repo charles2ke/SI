@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
 
-from si.db import Chunk, Collection
+from si.db import Chunk, Collection, Span
 from si.rag import RAGService, chunk_text, parse_document, reciprocal_rank_fusion
 from si.rag.network import UnsafeURLError, safe_fetch
 
@@ -48,6 +48,8 @@ async def test_ingest_search_and_tenant_isolation(rag):
     hits = await rag.search("test-one", ["documents"], "Apple")
     assert hits[0]["text"] == "Apple release notes"
     assert hits[0]["score"] > 0
+    kinds = {span.kind for span in rag.session.scalars(select(Span)).all()}
+    assert {"embedding", "ingestion", "retrieval"} <= kinds
     with pytest.raises(ValueError, match="project"):
         await rag.search("test-two", ["documents"], "Apple")
     with pytest.raises(ValueError, match="project"):
@@ -84,6 +86,12 @@ async def test_postgres_hybrid_uses_separate_vector_and_lexical_rankings():
             return self
 
     class Session:
+        def add(self, row):
+            pass
+
+        def commit(self):
+            pass
+
         def scalars(self, statement):
             statements.append(str(statement.compile(dialect=postgresql.dialect())))
             return Results(next(results))

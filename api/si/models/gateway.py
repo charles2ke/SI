@@ -2,6 +2,11 @@
 
 The default mock needs no credentials. Use provider-prefixed model names, or
 ``auto`` / ``cheapest`` / ``fastest`` / ``best`` for configured-provider routing.
+Override catalog IDs with OPENAI_MODEL, ANTHROPIC_MODEL, GEMINI_MODEL, and
+OPENAI_COMPATIBLE_MODEL (bare provider model IDs). Provider releases may retire
+built-in examples; use an ID available to your account, or an explicit
+``provider:model`` request. Catalog prices/ranks remain approximate even when
+IDs are overridden. Paid-provider availability is not verified by this module.
 No prompt or credentials are included in provider error messages.
 """
 
@@ -11,6 +16,7 @@ import json
 import math
 import os
 import re
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -21,7 +27,7 @@ from referencing.exceptions import Unresolvable
 
 from .schemas import ChatRequest, ChatResponse, ToolCall
 
-MODELS: dict[str, dict[str, Any]] = {
+_DEFAULT_MODELS: dict[str, dict[str, Any]] = {
     "mock": {"provider": "mock", "input_price": 0.0, "output_price": 0.0, "speed": 0, "quality": 0},
     "openai:gpt-4o-mini": {
         "provider": "openai", "input_price": 0.15, "output_price": 0.60, "speed": 1, "quality": 2,
@@ -29,13 +35,33 @@ MODELS: dict[str, dict[str, Any]] = {
     "anthropic:claude-sonnet-4-20250514": {
         "provider": "anthropic", "input_price": 3.0, "output_price": 15.0, "speed": 3, "quality": 3,
     },
-    "gemini:gemini-2.0-flash": {
-        "provider": "gemini", "input_price": 0.10, "output_price": 0.40, "speed": 2, "quality": 1,
+    "gemini:gemini-2.5-flash": {
+        "provider": "gemini", "input_price": 0.30, "output_price": 2.50, "speed": 2, "quality": 1,
     },
     "compatible:default": {
         "provider": "compatible", "input_price": 0.0, "output_price": 0.0, "speed": 1, "quality": 1,
     },
 }
+MODEL_ENV = {
+    "openai": "OPENAI_MODEL",
+    "anthropic": "ANTHROPIC_MODEL",
+    "gemini": "GEMINI_MODEL",
+    "compatible": "OPENAI_COMPATIBLE_MODEL",
+}
+
+
+def _catalog() -> dict[str, dict[str, Any]]:
+    catalog = {}
+    for default, info in _DEFAULT_MODELS.items():
+        provider = info["provider"]
+        model = os.getenv(MODEL_ENV[provider], "").strip() if provider != "mock" else ""
+        identifier = f"{provider}:{model}" if model else default
+        catalog[identifier] = info.copy()
+    return catalog
+
+
+# Backward-compatible startup catalog for API callers importing MODELS directly.
+MODELS = _catalog()
 KEYS = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
@@ -141,22 +167,24 @@ class Gateway:
 
     def model_info(self, model: str) -> dict[str, Any]:
         provider, _ = self._resolve(model)
-        info = MODELS.get(model, next(value for value in MODELS.values() if value["provider"] == provider))
+        catalog = _catalog()
+        info = catalog.get(model, next(value for value in catalog.values() if value["provider"] == provider))
         return {"id": model, **info, "available": self._available(provider)}
 
     def list_models(self) -> list[dict[str, Any]]:
-        return [self.model_info(model) for model in MODELS]
+        return [self.model_info(model) for model in _catalog()]
 
     def route(self, policy: str | None = None) -> str:
         policy = policy or self.policy
         if policy not in ("cheapest", "fastest", "best"):
             raise ValueError("Unknown routing policy")
-        candidates = [name for name, info in MODELS.items()
+        catalog = _catalog()
+        candidates = [name for name, info in catalog.items()
                       if name != "mock" and self._available(info["provider"])]
         if not candidates:
             return "mock"
         def score(name: str) -> float:
-            info = MODELS[name]
+            info = catalog[name]
             if policy == "best":
                 return -float(info["quality"])
             return float(info["speed"] if policy == "fastest" else info["input_price"] + info["output_price"])
@@ -182,7 +210,7 @@ class Gateway:
         automatic = model in ("auto", "cheapest", "fastest", "best")
         primary = self.route(None if model == "auto" else model) if automatic else model
         alternatives = [
-            name for name, info in MODELS.items()
+            name for name, info in _catalog().items()
             if name != "mock" and self._available(info["provider"])
         ] if automatic else []
         return list(dict.fromkeys([primary, *self.fallback_models, *alternatives]))
@@ -209,7 +237,7 @@ class Gateway:
 
     @staticmethod
     def _check_schema(schema: dict[str, Any]) -> None:
-        """Bound untrusted schema work and forbid remote reference resolution."""
+        """Bound schema work; regex and dynamic/recursive references are unsupported."""
         pending: list[tuple[Any, int]] = [(schema, 0)]
         nodes = 0
         size = 0
@@ -226,6 +254,10 @@ class Gateway:
                         reference = value[keyword]
                         if not isinstance(reference, str) or not reference.startswith("#"):
                             raise GatewayError("Only local schema references are supported")
+                        if keyword != "$ref":
+                            raise GatewayError("Dynamic and recursive schema references are not supported")
+                if "pattern" in value or "patternProperties" in value:
+                    raise GatewayError("Regex schema keywords are not supported")
                 for key, child in value.items():
                     if not isinstance(key, str):
                         raise GatewayError("JSON schema keys must be strings")
@@ -381,7 +413,8 @@ class Gateway:
         elif provider == "gemini":
             parts = data["candidates"][0]["content"].get("parts", [])
             content = "".join(p.get("text", "") for p in parts)
-            calls = [ToolCall(id=f"gemini-{i}", name=p["functionCall"]["name"],
+            response_id = uuid.uuid4().hex
+            calls = [ToolCall(id=f"gemini-{response_id}-{i}", name=p["functionCall"]["name"],
                               arguments=_arguments(p["functionCall"].get("args", {})))
                      for i, p in enumerate(parts) if "functionCall" in p]
             usage = data.get("usageMetadata", {})

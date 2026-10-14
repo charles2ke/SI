@@ -14,7 +14,8 @@ def request(**kwargs):
 @pytest.fixture(autouse=True)
 def clear_credentials(monkeypatch):
     for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
-                "OPENAI_COMPATIBLE_BASE_URL", "OPENAI_COMPATIBLE_API_KEY", "EMBEDDING_MODEL"):
+                "OPENAI_COMPATIBLE_BASE_URL", "OPENAI_COMPATIBLE_API_KEY", "EMBEDDING_MODEL",
+                "OPENAI_MODEL", "ANTHROPIC_MODEL", "GEMINI_MODEL", "OPENAI_COMPATIBLE_MODEL"):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -65,11 +66,43 @@ def test_routing(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    assert gateway.route("cheapest").startswith("gemini:")
+    assert gateway.route("cheapest").startswith("openai:")
     assert gateway.route("fastest").startswith("openai:")
     assert gateway.route("best").startswith("anthropic:")
     assert gateway.model_info("openai:custom")["available"]
     assert len(gateway.list_models()) == 5
+
+
+@pytest.mark.parametrize(("provider", "env", "policy"), [
+    ("openai", "OPENAI_MODEL", "fastest"),
+    ("anthropic", "ANTHROPIC_MODEL", "best"),
+    ("gemini", "GEMINI_MODEL", "cheapest"),
+    ("compatible", "OPENAI_COMPATIBLE_MODEL", "cheapest"),
+])
+@pytest.mark.asyncio
+async def test_provider_catalog_defaults_are_environment_configurable(monkeypatch, provider, env, policy):
+    monkeypatch.setenv(env, "account-supported-model")
+    if provider == "compatible":
+        monkeypatch.setenv("OPENAI_COMPATIBLE_BASE_URL", "https://local.example/v1")
+    else:
+        monkeypatch.setenv(f"{provider.upper()}_API_KEY", "test-key")
+    def handle(req):
+        payload = json.loads(req.content)
+        if provider == "gemini":
+            assert "account-supported-model:generateContent" in str(req.url)
+            return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": "ok"}]}}]})
+        assert payload["model"] == "account-supported-model"
+        if provider == "anthropic":
+            return httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+    gateway = Gateway(transport=httpx.MockTransport(handle))
+    expected = f"{provider}:account-supported-model"
+    assert gateway.route(policy) == expected
+    assert expected in {item["id"] for item in gateway.list_models()}
+    assert gateway.model_info(expected)["provider"] == provider
+    response = await gateway.chat(request(model="auto"))
+    assert response.model == expected
+    assert response.content == "ok"
 
 
 @pytest.mark.asyncio
@@ -281,15 +314,53 @@ async def test_mock_schema_cannot_allocate_unbounded_samples(schema):
 
 
 @pytest.mark.asyncio
+async def test_gemini_tool_ids_are_unique_across_responses(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    payload = {"candidates": [{"content": {"parts": [
+        {"functionCall": {"name": "calculator", "args": {"expression": "1+1"}}},
+        {"functionCall": {"name": "calculator", "args": {"expression": "2+2"}}},
+    ]}}]}
+    gateway = Gateway(transport=httpx.MockTransport(lambda req: httpx.Response(200, json=payload)))
+    first = await gateway.chat(request(model="gemini:test"))
+    second = await gateway.chat(request(model="gemini:test"))
+    identifiers = [call.id for response in (first, second) for call in response.tool_calls]
+    assert len(identifiers) == len(set(identifiers)) == 4
+    assert all(identifier.startswith("gemini-") for identifier in identifiers)
+    assert first.tool_calls[0].name == second.tool_calls[0].name == "calculator"
+    assert first.tool_calls[0].arguments == second.tool_calls[0].arguments == {"expression": "1+1"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schema", [
+    {"$dynamicAnchor": "node", "$dynamicRef": "#node"},
+    {"$recursiveAnchor": True, "$recursiveRef": "#"},
+    {"type": "string", "pattern": "(a+)+$"},
+    {"type": "object", "patternProperties": {"(a+)+$": {"type": "string"}}},
+    {"type": "object", "$defs": {"unused": {"pattern": "a*a*a*a*b"}}},
+])
+@pytest.mark.parametrize("target", ["response", "tool"])
+async def test_unsafe_schema_features_rejected_before_provider(monkeypatch, schema, target):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    def unexpected_network(req):
+        raise AssertionError("Unsafe schema reached a provider")
+    options: dict[str, Any] = {"response_schema": schema} if target == "response" else {
+        "tools": [ToolSpec(name="tool", description="test", parameters=schema)],
+    }
+    gateway = Gateway(transport=httpx.MockTransport(unexpected_network))
+    with pytest.raises(GatewayError, match="not supported"):
+        await gateway.chat(request(model="openai:test", **options))
+
+
+@pytest.mark.asyncio
 async def test_automatic_routing_falls_back_to_other_configured_provider(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     def handle(req):
-        if "googleapis" in req.url.host:
+        if "openai" in req.url.host:
             return httpx.Response(503)
-        return httpx.Response(200, json={"choices": [{"message": {"content": "fallback"}}]})
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": "fallback"}]}}]})
     result = await Gateway(transport=httpx.MockTransport(handle), retries=0).chat(request(model="cheapest"))
-    assert result.model.startswith("openai:")
+    assert result.model.startswith("gemini:")
     assert result.content == "fallback"
 
 

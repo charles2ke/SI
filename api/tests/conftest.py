@@ -17,6 +17,7 @@ class FakeRedis:
         self.values = {}
         self.usage = [0, 0.0]
         self.rate = 0
+        self.http_rate = 0
 
     async def ping(self):
         return True
@@ -28,6 +29,11 @@ class FakeRedis:
         self.values[key] = value
 
     async def eval(self, script, count, *args):
+        if count == 1:
+            if self.http_rate >= args[1]:
+                return 1
+            self.http_rate += 1
+            return 0
         if count == 3:
             rate_limit, tokens, token_limit, cost, cost_limit, _ = args[3:]
             if self.rate >= rate_limit:
@@ -47,7 +53,7 @@ class FakeRedis:
 
 @pytest.fixture
 def database():
-    url = os.getenv("SI_TEST_DATABASE_URL", "sqlite://")
+    url = os.getenv("SI_TEST_DATABASE_URL", os.getenv("DATABASE_URL", "sqlite://"))
     options = {"connect_args": {"check_same_thread": False}, "poolclass": StaticPool} if url == "sqlite://" else {}
     engine = create_engine(url.replace("postgresql://", "postgresql+psycopg://", 1), **options)
     if engine.dialect.name == "postgresql":
