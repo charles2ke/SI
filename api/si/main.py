@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import string
 import time
 from contextlib import asynccontextmanager
@@ -14,6 +15,7 @@ from arq import create_pool
 from arq.connections import RedisSettings
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from redis.exceptions import RedisError
 from sqlalchemy import func, select, text
@@ -38,6 +40,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="SI", version="0.1.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in
+                   os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if origin.strip()],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
+)
 DB = Annotated[Session, Depends(get_session)]
 Key = Annotated[APIKey, Depends(require_key)]
 Admin = Annotated[APIKey, Depends(require_admin)]

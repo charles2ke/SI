@@ -78,6 +78,10 @@ def test_cli_target_is_required():
         parser().parse_args(["eval", "run", "dataset.json"])
     args = parser().parse_args(["eval", "run", "dataset.json", "--agent", "a1"])
     assert args.threshold == 1
+    assert args.model == "mock"
+    assert parser().parse_args([
+        "eval", "run", "dataset.json", "--prompt", "p1", "--model", "openai:gpt-4o-mini",
+    ]).model == "openai:gpt-4o-mini"
 
 
 def test_approval_payload():

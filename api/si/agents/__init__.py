@@ -105,7 +105,11 @@ class AgentExecutor:
             raise ValueError("Run has no pending approval")
         claimed = self.session.execute(
             update(Run)
-            .where(Run.id == run_id, Run.status == "waiting_approval")
+            .where(
+                Run.id == run_id,
+                Run.status == "waiting_approval",
+                Run.pending_tool["id"].as_string() == run.pending_tool["id"],
+            )
             .values(pending_tool={**run.pending_tool, "approved": approved}, status="queued")
         )
         self.session.commit()
@@ -222,6 +226,12 @@ class AgentExecutor:
                     raise ValueError("Too many tool calls in one step")
                 if len({call["id"] for call in calls}) != len(calls):
                     raise ValueError("Duplicate tool call IDs")
+                prior_ids = {
+                    call["id"] for message in run.messages
+                    for call in message.get("tool_calls", [])
+                }
+                if any(call["id"] in prior_ids for call in calls):
+                    raise ValueError("Tool call IDs must be unique within a run")
                 run.steps += 1
                 assistant: dict[str, Any] = {"role": "assistant", "content": response.content or ""}
                 if calls:

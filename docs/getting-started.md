@@ -57,7 +57,20 @@ uv run --project sdk/python si eval run examples/eval.json \
 
 Use `--prompt NAME --version NUMBER` instead to evaluate a specific prompt version.
 Exact match, contains, regex, JSON-schema validation and model-judge scorers have
-different expected-value formats; consult `/docs` and the scorer module examples.
+different expected-value formats:
+
+| Scorer | Dataset `expected` |
+|---|---|
+| `exact_match` | The complete output string |
+| `contains` | A substring that must occur in the output |
+| `regex` | A regex pattern (bounded, isolated execution) |
+| `json_schema` | A JSON-schema object; the output must parse as valid JSON |
+| `llm_judge` | Desired answer/criteria, compared by a model returning score 0–1 |
+
+Use `--model openai:gpt-4o-mini` (with a configured key) for prompt evaluation or a
+hosted judge. The default mock judge is deterministic but **does not measure quality**.
+Schema references and regex keywords may be restricted to prevent remote fetching
+or unbounded validation; use simple inline schemas.
 The CLI exits nonzero below threshold or on execution errors.
 
 ## Approvals and outbound tools

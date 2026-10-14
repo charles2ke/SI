@@ -144,7 +144,8 @@ uv sync --frozen
 uv run ruff check si tests
 uv run mypy si
 uv run pytest -q
-# With DATABASE_URL pointing to pgvector/Postgres, tests cover the real DB path.
+# Set SI_TEST_DATABASE_URL for real pgvector/Postgres tests (a disposable database).
+# Set SI_TEST_REDIS_URL for the Redis integration test (a disposable Redis DB).
 
 cd ../sdk/python
 uv sync --frozen

@@ -86,6 +86,7 @@ def _python_limits() -> None:
     resource.setrlimit(resource.RLIMIT_AS, (128 * 1024 * 1024, 128 * 1024 * 1024))
     resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
     resource.setrlimit(resource.RLIMIT_NOFILE, (16, 16))
+    resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 

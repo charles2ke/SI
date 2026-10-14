@@ -37,6 +37,7 @@ def parser() -> argparse.ArgumentParser:
     target.add_argument("--agent")
     target.add_argument("--prompt")
     evaluate.add_argument("--version", type=int, default=1)
+    evaluate.add_argument("--model", default="mock", help="Prompt evaluation and LLM-judge model")
     evaluate.add_argument("--scorer", default="exact_match",
                           choices=["exact_match", "contains", "regex", "json_schema", "llm_judge"])
     evaluate.add_argument("--threshold", type=float, default=1)
@@ -71,7 +72,7 @@ def main() -> int:
                 target = {"agent_id": args.agent} if args.agent else {
                     "prompt_name": args.prompt, "prompt_version": args.version,
                 }
-                result = client.evaluate(dataset, args.scorer, **target)
+                result = client.evaluate(dataset, args.scorer, model=args.model, **target)
                 print(json.dumps(result, indent=2))
                 return 0 if result["score"] >= args.threshold else 1
     except (SIError, ValueError, OSError, TimeoutError, httpx.HTTPError) as error:

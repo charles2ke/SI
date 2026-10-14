@@ -16,6 +16,8 @@ from typing import Any
 
 import httpx
 import jsonschema
+from referencing import Registry
+from referencing.exceptions import Unresolvable
 
 from .schemas import ChatRequest, ChatResponse, ToolCall
 
@@ -54,7 +56,14 @@ def _arguments(value: Any) -> dict[str, Any]:
     return value
 
 
-def _sample(schema: dict[str, Any], root: dict[str, Any] | None = None, depth: int = 0) -> Any:
+def _sample(
+    schema: dict[str, Any], root: dict[str, Any] | None = None,
+    depth: int = 0, budget: list[int] | None = None,
+) -> Any:
+    budget = [2048] if budget is None else budget
+    budget[0] -= 1
+    if budget[0] < 0:
+        raise GatewayError("Mock schema sample exceeds node limits")
     if depth > 16:
         raise GatewayError("Mock schema exceeds supported recursion depth")
     root = schema if root is None else root
@@ -65,7 +74,7 @@ def _sample(schema: dict[str, Any], root: dict[str, Any] | None = None, depth: i
         target: Any = root
         for part in reference[2:].split("/"):
             target = target[part.replace("~1", "/").replace("~0", "~")]
-        return _sample(target, root, depth + 1)
+        return _sample(target, root, depth + 1, budget)
     for field in ("const", "default"):
         if field in schema:
             return schema[field]
@@ -73,19 +82,23 @@ def _sample(schema: dict[str, Any], root: dict[str, Any] | None = None, depth: i
         return schema["enum"][0]
     for union in ("anyOf", "oneOf"):
         if union in schema:
-            return _sample(schema[union][0], root, depth + 1)
+            return _sample(schema[union][0], root, depth + 1, budget)
     kind = schema.get("type", "object")
     if isinstance(kind, list):
         kind = next((item for item in kind if item != "null"), "null")
     if kind == "object":
         return {
-            key: _sample(value, root, depth + 1)
+            key: _sample(value, root, depth + 1, budget)
             for key, value in schema.get("properties", {}).items()
         }
     if kind == "array":
-        return [_sample(schema.get("items", {}), root, depth + 1)
-                for _ in range(schema.get("minItems", 0))]
+        count = schema.get("minItems", 0)
+        if count > 128:
+            raise GatewayError("Mock schema sample exceeds array limits")
+        return [_sample(schema.get("items", {}), root, depth + 1, budget) for _ in range(count)]
     if kind == "string":
+        if schema.get("minLength", 0) > 4096:
+            raise GatewayError("Mock schema sample exceeds string limits")
         formats = {"email": "sample@example.com", "date": "2026-01-01", "date-time": "2026-01-01T00:00:00Z"}
         value = formats.get(schema.get("format", ""), "sample")
         return value[:schema.get("maxLength", len(value))].ljust(schema.get("minLength", 0), "x")
@@ -175,17 +188,19 @@ class Gateway:
         return list(dict.fromkeys([primary, *self.fallback_models, *alternatives]))
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
-        if request.response_schema is not None:
-            self._check_schema(request.response_schema)
+        self._check_request_schemas(request)
         for model in self._candidates(request.model):
             for attempt in range(self.retries + 1):
                 try:
                     response = await self._chat(request.model_copy(update={"model": model}))
                     if request.response_schema is not None and not response.tool_calls:
-                        jsonschema.validate(json.loads(response.content), request.response_schema)
+                        jsonschema.Draft202012Validator(
+                            request.response_schema, registry=Registry(),
+                        ).validate(json.loads(response.content))
                     return response
                 except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError,
-                        jsonschema.ValidationError, jsonschema.SchemaError, GatewayError) as exc:
+                        jsonschema.ValidationError, jsonschema.SchemaError, Unresolvable,
+                        RecursionError, GatewayError) as exc:
                     if not self._retryable(exc):
                         break
                     if attempt < self.retries:
@@ -194,24 +209,49 @@ class Gateway:
 
     @staticmethod
     def _check_schema(schema: dict[str, Any]) -> None:
-        # Schemas are untrusted: never let a validator retrieve remote references.
-        def check(value: Any) -> None:
+        """Bound untrusted schema work and forbid remote reference resolution."""
+        pending: list[tuple[Any, int]] = [(schema, 0)]
+        nodes = 0
+        size = 0
+        while pending:
+            value, depth = pending.pop()
+            nodes += 1
+            if depth > 32 or nodes > 2048:
+                raise GatewayError("JSON schema exceeds nesting or node limits")
             if isinstance(value, dict):
-                reference = value.get("$ref")
-                if reference is not None and (
-                    not isinstance(reference, str) or not reference.startswith("#")
-                ):
-                    raise GatewayError("Only local schema references are supported")
-                for child in value.values():
-                    check(child)
+                if len(value) + len(pending) > 2048:
+                    raise GatewayError("JSON schema exceeds node limits")
+                for keyword in ("$ref", "$dynamicRef", "$recursiveRef"):
+                    if keyword in value:
+                        reference = value[keyword]
+                        if not isinstance(reference, str) or not reference.startswith("#"):
+                            raise GatewayError("Only local schema references are supported")
+                for key, child in value.items():
+                    if not isinstance(key, str):
+                        raise GatewayError("JSON schema keys must be strings")
+                    size += len(key)
+                    pending.append((child, depth + 1))
             elif isinstance(value, list):
+                if len(value) + len(pending) > 2048:
+                    raise GatewayError("JSON schema exceeds node limits")
                 for child in value:
-                    check(child)
-        check(schema)
+                    pending.append((child, depth + 1))
+            elif isinstance(value, str):
+                size += len(value)
+            if size > 65536 or len(pending) > 2048:
+                raise GatewayError("JSON schema exceeds size limits")
         try:
+            if len(json.dumps(schema, allow_nan=False).encode("utf-8")) > 65536:
+                raise GatewayError("JSON schema exceeds size limits")
             jsonschema.Draft202012Validator.check_schema(schema)
-        except jsonschema.SchemaError:
-            raise GatewayError("Invalid response JSON schema") from None
+        except (jsonschema.SchemaError, ValueError, TypeError, RecursionError):
+            raise GatewayError("Invalid JSON schema") from None
+
+    def _check_request_schemas(self, request: ChatRequest) -> None:
+        if request.response_schema is not None:
+            self._check_schema(request.response_schema)
+        for tool in request.tools:
+            self._check_schema(tool.parameters)
 
     @staticmethod
     def _retryable(exc: Exception) -> bool:
@@ -390,8 +430,7 @@ class Gateway:
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[str]:
         """Yield content deltas. Retry/fallback only before emitting any content."""
-        if request.response_schema is not None:
-            self._check_schema(request.response_schema)
+        self._check_request_schemas(request)
         for model in self._candidates(request.model):
             for attempt in range(self.retries + 1):
                 emitted = False

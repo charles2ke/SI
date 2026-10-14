@@ -207,6 +207,80 @@ async def test_remote_json_schema_is_rejected_without_network():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("keyword", ["$ref", "$dynamicRef", "$recursiveRef"])
+@pytest.mark.parametrize("location", ["root", "properties", "defs", "array"])
+@pytest.mark.parametrize("target", ["response", "tool"])
+@pytest.mark.parametrize("mode", ["chat", "stream"])
+async def test_nested_remote_schema_refs_never_fetch(monkeypatch, keyword, location, target, mode):
+    def unexpected_network(*args, **kwargs):
+        raise AssertionError("Untrusted schema caused a network request")
+    monkeypatch.setattr("urllib.request.urlopen", unexpected_network)
+    monkeypatch.setattr("socket.create_connection", unexpected_network)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    remote: dict[str, Any] = {keyword: "https://untrusted.example/schema"}
+    schema = {
+        "root": remote,
+        "properties": {"type": "object", "properties": {"value": remote}},
+        "defs": {"type": "object", "$defs": {"unused": remote}},
+        "array": {"type": "array", "items": {"allOf": [remote]}},
+    }[location]
+    options: dict[str, Any] = {"response_schema": schema} if target == "response" else {
+        "tools": [ToolSpec(name="tool", description="test", parameters=schema)],
+    }
+    req = request(model="openai:test", **options)
+    gateway = Gateway(transport=httpx.MockTransport(unexpected_network))
+    with pytest.raises(GatewayError, match="Only local schema"):
+        if mode == "chat":
+            await gateway.chat(req)
+        else:
+            _ = [chunk async for chunk in gateway.stream(req)]
+
+
+@pytest.mark.parametrize("schema", [
+    {"description": "x" * 65537},
+    {"description": "é" * 20000},
+    {"enum": list(range(2050))},
+])
+def test_schema_size_and_node_bounds(schema):
+    with pytest.raises(GatewayError, match="limits"):
+        Gateway._check_schema(schema)
+
+
+@pytest.mark.parametrize("cyclic", [False, True])
+def test_schema_depth_and_cycles_are_bounded(cyclic):
+    schema: dict[str, Any] = {"type": "object"}
+    nested = schema
+    for _ in range(40):
+        child: dict[str, Any] = {}
+        nested["properties"] = {"nested": child}
+        nested = child
+    if cyclic:
+        nested["loop"] = schema
+    with pytest.raises(GatewayError, match="nesting"):
+        Gateway._check_schema(schema)
+
+
+@pytest.mark.asyncio
+async def test_local_schema_refs_work_without_fetch(monkeypatch):
+    def unexpected_network(*args, **kwargs):
+        raise AssertionError("Local schema should not fetch resources")
+    monkeypatch.setattr("urllib.request.urlopen", unexpected_network)
+    schema = {"type": "object", "$defs": {"answer": {"type": "integer", "minimum": 7}},
+              "properties": {"answer": {"$ref": "#/$defs/answer"}}, "required": ["answer"]}
+    assert json.loads((await Gateway().chat(request(response_schema=schema))).content) == {"answer": 7}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schema", [
+    {"type": "array", "minItems": 10**9},
+    {"type": "string", "minLength": 10**9},
+])
+async def test_mock_schema_cannot_allocate_unbounded_samples(schema):
+    with pytest.raises(GatewayError):
+        await Gateway().chat(request(response_schema=schema))
+
+
+@pytest.mark.asyncio
 async def test_automatic_routing_falls_back_to_other_configured_provider(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
