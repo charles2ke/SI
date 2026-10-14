@@ -53,6 +53,16 @@ async def test_schema_cannot_fetch_remote_references():
         await score("json_schema", '"aaa"', {"type": "string", "pattern": "(a+)+$"})
 
 
+@pytest.mark.parametrize("keyword", ["$ref", "$dynamicRef", "$recursiveRef"])
+async def test_schema_nested_definitions_cannot_fetch_references(keyword):
+    schema = {
+        "type": "object",
+        "properties": {"nested": {"allOf": [{keyword: "http://127.0.0.1/internal"}]}},
+    }
+    with pytest.raises(ValueError, match="references"):
+        await score("json_schema", "{}", schema)
+
+
 async def test_evaluation_persists_individual_results(database):
     with database() as session:
         result = await evaluate(

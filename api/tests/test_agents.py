@@ -1,11 +1,20 @@
 import json
+import os
+import signal
 
 import pytest
 from sqlalchemy import select
 
 from si.agents import AgentExecutor
 from si.agents.memory import MemoryStore
-from si.agents.tools import MCPClient, RegisteredTool, build_tools, calculate, python_execute
+from si.agents.tools import (
+    MCPClient,
+    RegisteredTool,
+    build_tools,
+    calculate,
+    python_execute,
+    validate_tool_schema,
+)
 from si.db import Agent, Memory, Run, Span
 from si.models import ChatResponse, ToolCall, ToolSpec
 
@@ -62,6 +71,23 @@ async def test_python_opt_in_does_not_inherit_secrets(monkeypatch):
     assert (await python_execute("import os; print(os.environ.get('SI_TEST_PRIVATE_VALUE'))")).strip() == "None"
     with pytest.raises(ValueError, match="output"):
         await python_execute("print('x' * 100000)")
+
+
+async def test_python_always_cleans_process_group(monkeypatch):
+    monkeypatch.setenv("SI_ENABLE_PYTHON_TOOL", "true")
+    groups = []
+    killpg = os.killpg
+
+    def record(group, sig):
+        groups.append((group, sig))
+        return killpg(group, sig)
+
+    monkeypatch.setattr(os, "killpg", record)
+    assert (await python_execute("print('done')")).strip() == "done"
+    with pytest.raises(ValueError, match="output"):
+        await python_execute("print('x' * 100000)")
+    assert len(groups) == 2
+    assert all(group > 0 and sig == signal.SIGKILL for group, sig in groups)
 
 
 async def test_memory_store_long_term_project_scope(agent_session):
@@ -272,6 +298,16 @@ async def test_tool_schema_cannot_resolve_network_references():
     )
     with pytest.raises(ValueError, match="references"):
         await tool.call({})
+
+
+@pytest.mark.parametrize("keyword", ["$ref", "$dynamicRef", "$recursiveRef"])
+def test_mcp_schema_nested_definitions_cannot_fetch_references(keyword):
+    schema = {
+        "type": "object",
+        "$defs": {"nested": {"allOf": [{keyword: "http://127.0.0.1/internal"}]}},
+    }
+    with pytest.raises(ValueError, match="references"):
+        validate_tool_schema(schema)
 
 
 def test_agent_http_api_mock_tool_loop_and_sse(client, redis):

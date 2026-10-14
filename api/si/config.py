@@ -9,6 +9,8 @@ class Settings:
     redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", "redis://localhost:6379/0"))
     bootstrap_key: str = field(default_factory=lambda: os.getenv(
         "SI_BOOTSTRAP_KEY", "si-local-development"))
+    key_hash_secret: str = field(default_factory=lambda: os.getenv(
+        "SI_KEY_HASH_SECRET", os.getenv("SI_BOOTSTRAP_KEY", "si-local-development")))
     rate_limit: int = field(default_factory=lambda: int(os.getenv("SI_RATE_LIMIT", "120")))
     monthly_tokens: int = field(default_factory=lambda: int(os.getenv("SI_MONTHLY_TOKENS", "1000000")))
     monthly_cost: float = field(default_factory=lambda: float(os.getenv("SI_MONTHLY_COST", "100")))

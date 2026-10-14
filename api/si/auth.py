@@ -1,4 +1,4 @@
-import hashlib
+import hmac
 import logging
 import secrets
 from typing import Annotated, Any
@@ -14,7 +14,7 @@ from si.tracing import record_span
 
 
 def hash_key(raw: str) -> str:
-    return hashlib.sha256(raw.encode()).hexdigest()
+    return hmac.digest(settings.key_hash_secret.encode(), raw.encode(), "sha256").hex()
 
 
 def bootstrap() -> None:

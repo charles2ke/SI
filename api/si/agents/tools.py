@@ -10,6 +10,7 @@ import operator
 import os
 import re
 import resource
+import signal
 import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -119,8 +120,10 @@ async def python_execute(code: str) -> str:
                     raise ValueError("Python output exceeds 64 KiB")
             await process.wait()
     finally:
-        if process.returncode is None:
-            process.kill()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         await process.wait()
     result = output.decode("utf-8", errors="replace")
     if process.returncode:
