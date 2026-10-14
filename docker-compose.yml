@@ -1,0 +1,93 @@
+name: si
+
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: api/Dockerfile
+  environment: &backend-env
+    DATABASE_URL: postgresql+psycopg://si:${POSTGRES_PASSWORD:-si-local-postgres}@postgres:5432/si
+    REDIS_URL: redis://redis:6379/0
+    SI_BOOTSTRAP_KEY: ${SI_BOOTSTRAP_KEY:-si-local-development}
+    CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    OPENAI_COMPATIBLE_BASE_URL: ${OPENAI_COMPATIBLE_BASE_URL:-}
+    OPENAI_COMPATIBLE_API_KEY: ${OPENAI_COMPATIBLE_API_KEY:-}
+    EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+    HTTP_ALLOWED_HOSTS: ${HTTP_ALLOWED_HOSTS:-}
+    SI_MCP_SERVERS: ${SI_MCP_SERVERS:-{}}
+    SI_ENABLE_PYTHON_TOOL: ${SI_ENABLE_PYTHON_TOOL:-false}
+    SI_RATE_LIMIT: ${SI_RATE_LIMIT:-120}
+    SI_MONTHLY_TOKENS: ${SI_MONTHLY_TOKENS:-1000000}
+    SI_MONTHLY_COST: ${SI_MONTHLY_COST:-100}
+    SI_CACHE_TTL: ${SI_CACHE_TTL:-300}
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: si
+      POSTGRES_USER: si
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-si-local-postgres}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U si -d si"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    <<: *backend
+    command: uvicorn si.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+
+  worker:
+    <<: *backend
+    command: arq worker.main.WorkerSettings
+    depends_on:
+      api:
+        condition: service_healthy
+
+  web:
+    build:
+      context: web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
