@@ -1,0 +1,5 @@
+Super Intelligence (SI) is a modular AI building platform.
+Its local demo uses a deterministic mock model, so no provider credentials are required.
+Projects contain knowledge collections, agents, versioned prompts, evaluation results and traces.
+Agents may search their project's knowledge bases and perform arithmetic using the calculator.
+Sensitive tools require human approval. Python subprocess execution is not a production sandbox.
