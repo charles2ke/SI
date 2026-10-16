@@ -5,6 +5,7 @@ from sqlalchemy import select
 
 from si.config import settings
 from si.db import Run, SessionLocal
+from si.quotas import get_redis
 
 
 async def execute_agent(ctx, run_id: str):
@@ -41,9 +42,14 @@ async def startup(ctx):
         session.commit()
 
 
+async def shutdown(ctx):
+    await get_redis().aclose()
+
+
 class WorkerSettings:
     functions = [execute_agent]
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     on_startup = startup
+    on_shutdown = shutdown
     max_tries = 1
     job_timeout = 300
