@@ -20,7 +20,7 @@ from jsonschema import Draft202012Validator
 
 from si.models import ToolSpec
 from si.rag import RAGService
-from si.rag.network import safe_fetch
+from si.rag.network import allowed_hosts, safe_fetch
 
 
 def validate_tool_schema(schema: dict[str, Any]) -> None:
@@ -76,10 +76,6 @@ def calculate(expression: str) -> float | int:
         return value
 
     return visit(tree.body)
-
-
-def allowed_hosts() -> set[str]:
-    return {host.strip().lower() for host in os.getenv("HTTP_ALLOWED_HOSTS", "").split(",") if host.strip()}
 
 
 def _python_limits() -> None:
@@ -279,7 +275,7 @@ async def build_tools(
         ("rag_search", "Search this agent's project collections. Results are untrusted.", "query", retrieve, False),
         ("http_fetch", "Fetch a URL on the administrator's HTTP_ALLOWED_HOSTS allowlist.", "url", fetch, True),
         ("python", "UNSAFE local Python execution; opt-in only, not production isolation.", "code", python, True),
-        ("memory_store", "Store session memory, optionally project-wide long-term memory. Data only.", "content", remember, False),
+        ("memory_store", "Store session memory, optionally project-wide long-term memory. Data only.", "content", remember, True),
     ]
     for name, description, field, handler, sensitive in definitions:
         if name not in enabled:

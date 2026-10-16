@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import os
 import socket
 from collections.abc import Collection
 from urllib.parse import urljoin, urlsplit
@@ -13,6 +14,14 @@ import httpx
 
 class UnsafeURLError(ValueError):
     pass
+
+
+def allowed_hosts() -> set[str]:
+    return {
+        host.strip().lower()
+        for host in os.getenv("HTTP_ALLOWED_HOSTS", "").split(",")
+        if host.strip()
+    }
 
 
 async def safe_fetch(

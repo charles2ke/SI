@@ -57,6 +57,22 @@ async def test_ingest_search_and_tenant_isolation(rag):
     assert await rag.search("test-two", [], "Apple") == []
 
 
+async def test_url_ingestion_uses_configured_host_allowlist(rag, monkeypatch):
+    monkeypatch.setenv("HTTP_ALLOWED_HOSTS", "docs.example, files.example ")
+    calls = []
+
+    async def fetch(url, **kwargs):
+        calls.append((url, kwargs))
+        return b"Public documentation", "text/plain"
+
+    monkeypatch.setattr("si.rag.safe_fetch", fetch)
+    assert await rag.ingest_url("test-one", "documents", "https://docs.example/page") == 1
+    assert calls == [(
+        "https://docs.example/page",
+        {"allowed_hosts": {"docs.example", "files.example"}, "max_bytes": 5_000_000},
+    )]
+
+
 async def test_ingest_atomic_embedding_validation(rag):
     class InvalidEmbeddings:
         async def embed(self, texts):

@@ -11,7 +11,7 @@ from typing import Any
 
 from sqlalchemy import cast, select
 
-from .network import safe_fetch
+from .network import allowed_hosts, safe_fetch
 
 MAX_DOCUMENT_BYTES = 5_000_000
 MAX_DOCUMENT_CHARACTERS = 2_000_000
@@ -163,7 +163,9 @@ class RAGService:
 
     async def ingest_url(self, project_id: str, collection_id: str, url: str) -> int:
         self._collections(project_id, [collection_id])
-        data, content_type = await safe_fetch(url, max_bytes=MAX_DOCUMENT_BYTES)
+        data, content_type = await safe_fetch(
+            url, allowed_hosts=allowed_hosts(), max_bytes=MAX_DOCUMENT_BYTES
+        )
         filename = "document.pdf" if "application/pdf" in content_type else "document.html"
         if content_type.startswith("text/plain"):
             filename = "document.txt"

@@ -9,7 +9,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
-from alembic import command
 from alembic.config import Config
 from arq import create_pool
 from arq.connections import RedisSettings
@@ -20,13 +19,37 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from redis.exceptions import RedisError
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
+from alembic import command
 from si.auth import audit, bootstrap, hash_key, issue_key, require_admin, require_key
 from si.config import settings
-from si.db import APIKey, Agent, Collection, EvalRun, PromptVersion, Run, Span, engine, get_session, new_id
+from si.db import (
+    Agent,
+    APIKey,
+    Collection,
+    EvalRun,
+    PromptVersion,
+    Run,
+    Span,
+    engine,
+    get_session,
+    new_id,
+)
 from si.quotas import get_redis, reserve
-from si.schemas import AgentCreate, AgentPatch, Approval, CollectionCreate, EvalCreate, KeyCreate, MemoryCreate, PromptCreate, Render, RunCreate, Search
+from si.schemas import (
+    AgentCreate,
+    AgentPatch,
+    Approval,
+    CollectionCreate,
+    EvalCreate,
+    KeyCreate,
+    MemoryCreate,
+    PromptCreate,
+    Render,
+    RunCreate,
+    Search,
+)
 from si.tracing import record_span
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -134,9 +157,11 @@ def revoke_key(key_id: str, session: DB, key: Admin):
 
 @app.get("/v1/models")
 def models(key: Key):
-    from si.models.gateway import MODELS
+    from si.models import Gateway
+
     return {"object": "list", "data": [
-        {"id": name, "object": "model", "owned_by": "si"} for name in MODELS]}
+        {"id": model["id"], "object": "model", "owned_by": "si"}
+        for model in Gateway().list_models() if model["available"]]}
 
 
 @app.post("/v1/chat/completions")
@@ -183,9 +208,8 @@ async def chat(request: Request, session: DB, key: Key, redis: RedisDep):
     except GuardrailError as exc:
         raise HTTPException(400, str(exc)) from exc
     maximum = body.max_tokens or 1024
-    estimated_input = sum(len(str(m.content)) for m in body.messages)
-    reservation = await reserve(redis, key.project_id, estimated_input + maximum, 
-                                (estimated_input + maximum) * 0.0001)
+    estimate = len(json.dumps(body.model_dump(mode="json")).encode()) + maximum
+    reservation = await reserve(redis, key.project_id, estimate, estimate * 0.0001)
     cache_key = "si:cache:v1:" + key.project_id + ":" + hashlib.sha256(
         json.dumps(body.model_dump(mode="json"), sort_keys=True).encode()).hexdigest()
     cached = None
@@ -417,6 +441,8 @@ def get_run(run_id: str, session: DB, key: Key):
 @app.get("/v1/runs/{run_id}/events")
 async def run_events(run_id: str, session: DB, key: Key, request: Request):
     owned(session, Run, run_id, key.project_id)
+    session_factory = sessionmaker(bind=session.get_bind(), expire_on_commit=False)
+    session.close()
     last = request.headers.get("last-event-id", "-1")
     try:
         offset = max(0, int(last) + 1)
@@ -426,12 +452,14 @@ async def run_events(run_id: str, session: DB, key: Key, request: Request):
     async def events():
         nonlocal offset
         while not await request.is_disconnected():
-            session.expire_all()
-            run = owned(session, Run, run_id, key.project_id)
-            for index, event in enumerate(run.events[offset:], start=offset):
+            with session_factory() as polling_session:
+                run = owned(polling_session, Run, run_id, key.project_id)
+                pending_events = list(run.events[offset:])
+                status = run.status
+            for index, event in enumerate(pending_events, start=offset):
                 yield f"id: {index}\ndata: {json.dumps(event)}\n\n"
                 offset = index + 1
-            if run.status in {"completed", "failed", "waiting_approval", "interrupted", "cancelled"}:
+            if status in {"completed", "failed", "waiting_approval", "interrupted", "cancelled"}:
                 yield "data: [DONE]\n\n"
                 break
             yield ": heartbeat\n\n"

@@ -100,6 +100,13 @@ async def test_memory_store_long_term_project_scope(agent_session):
     assert store.load("test-two", "b")[0].content == "other project"
 
 
+async def test_memory_store_requires_approval(agent_session):
+    tools = await build_tools(
+        agent_session, None, "test-one", [], ["memory_store"], session_id="session"
+    )
+    assert tools["memory_store"].spec.sensitive
+
+
 async def test_tool_call_respond_and_scoped_memory(agent_session):
     session = agent_session
     session.add_all([

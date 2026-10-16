@@ -23,6 +23,18 @@ def test_models_and_chat_stream(client):
     assert client.get("/v1/traces").json()
 
 
+def test_models_only_lists_configured_providers(client, monkeypatch):
+    for variable in (
+        "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
+        "OPENAI_COMPATIBLE_BASE_URL",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    models = client.get("/v1/models").json()["data"]
+
+    assert [model["id"] for model in models] == ["mock"]
+
+
 def test_deterministic_cache_accounts_usage(client, redis):
     body = {"model": "mock", "messages": [{"role": "user", "content": "Hello"}], "temperature": 0}
     first = client.post("/v1/chat/completions", json=body)

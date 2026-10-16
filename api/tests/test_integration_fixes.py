@@ -25,6 +25,42 @@ async def test_eval_model_reaches_gateway(client, monkeypatch):
     assert calls == ["openai:example-model"]
 
 
+def test_chat_quota_estimate_includes_tool_schema(client, monkeypatch):
+
+    estimates = []
+
+    class Reservation:
+        async def reconcile(self, tokens, cost):
+            pass
+
+    async def capture_reservation(redis, project_id, tokens, cost):
+        estimates.append(tokens)
+        return Reservation()
+
+    async def chat(_self, request):
+        return ChatResponse(content="ok", model=request.model, input_tokens=1, output_tokens=1)
+
+    monkeypatch.setattr("si.main.reserve", capture_reservation)
+    monkeypatch.setattr("si.models.Gateway.chat", chat)
+    payload = {
+        "model": "mock",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 20,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {"type": "object", "description": "x" * 5000},
+            },
+        }],
+    }
+
+    response = client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200, response.text
+    assert estimates[0] > 20 + len("hi")
+
+
 async def test_worker_cancellation_persists_interruption(database, monkeypatch):
     from worker.main import execute_agent
 
