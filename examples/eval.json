@@ -1,0 +1,4 @@
+[
+  {"input": "What is 2 + 3?", "expected": "5"},
+  {"input": "What is 6 * 7?", "expected": "42"}
+]
