@@ -12,12 +12,12 @@ from typing import Annotated, Any
 from alembic.config import Config
 from arq import create_pool
 from arq.connections import RedisSettings
-from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from redis.exceptions import RedisError
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -27,6 +27,7 @@ from si.config import settings
 from si.db import (
     Agent,
     APIKey,
+    Chunk,
     Collection,
     EvalRun,
     PromptVersion,
@@ -48,7 +49,10 @@ from si.schemas import (
     PromptCreate,
     Render,
     RunCreate,
+    RunResume,
+    RunStatus,
     Search,
+    UrlIngest,
 )
 from si.tracing import record_span
 
@@ -103,9 +107,12 @@ def owned(session: Session, model: Any, identity: str, project_id: str):
     return obj
 
 
+INTERNAL_COLUMNS = frozenset({"claim_id"})
+
+
 def serialize(obj: Any) -> dict[str, Any]:
     return {column.name: jsonable_encoder(getattr(obj, column.name))
-            for column in obj.__table__.columns}
+            for column in obj.__table__.columns if column.name not in INTERNAL_COLUMNS}
 
 
 def list_owned(session: Session, model: Any, project_id: str):
@@ -297,7 +304,11 @@ async def chat(request: Request, session: DB, key: Key, redis: RedisDep):
 
 @app.get("/v1/collections")
 def collections(session: DB, key: Key):
-    return list_owned(session, Collection, key.project_id)
+    counts = {collection_id: count for collection_id, count in session.execute(
+        select(Chunk.collection_id, func.count()).where(Chunk.project_id == key.project_id)
+        .group_by(Chunk.collection_id))}
+    return [{**item, "chunks": counts.get(item["id"], 0)}
+            for item in list_owned(session, Collection, key.project_id)]
 
 
 @app.post("/v1/collections", status_code=201)
@@ -308,6 +319,28 @@ def create_collection(body: CollectionCreate, session: DB, key: Key):
     audit(session, key, "collection.create", item.id)
     session.commit()
     return serialize(item)
+
+
+@app.get("/v1/collections/{collection_id}")
+def get_collection(collection_id: str, session: DB, key: Key):
+    item = owned(session, Collection, collection_id, key.project_id)
+    chunks = session.scalar(
+        select(func.count()).select_from(Chunk).where(Chunk.collection_id == item.id))
+    return {**serialize(item), "chunks": chunks or 0}
+
+
+@app.delete("/v1/collections/{collection_id}", status_code=204)
+def delete_collection(collection_id: str, session: DB, key: Key):
+    item = owned(session, Collection, collection_id, key.project_id)
+    users = sorted(agent.name for agent in session.scalars(
+        select(Agent).where(Agent.project_id == key.project_id))
+        if item.id in (agent.collection_ids or []))
+    if users:
+        raise HTTPException(409, "Collection is used by agents: " + ", ".join(users[:10]))
+    session.execute(delete(Chunk).where(Chunk.collection_id == item.id))
+    session.delete(item)
+    audit(session, key, "collection.delete", item.id)
+    session.commit()
 
 
 @app.post("/v1/collections/{collection_id}/documents")
@@ -329,6 +362,27 @@ async def ingest_document(collection_id: str, file: UploadFile, session: DB, key
     return result
 
 
+@app.post("/v1/collections/{collection_id}/urls")
+async def ingest_url(collection_id: str, body: UrlIngest, session: DB, key: Key, redis: RedisDep):
+    import httpx
+
+    from si.agents.runtime import ProjectGateway
+    from si.rag import RAGService
+    owned(session, Collection, collection_id, key.project_id)
+    try:
+        chunks = await RAGService(session, ProjectGateway(session, key.project_id, redis)).ingest_url(
+            key.project_id, collection_id, body.url)
+    except (ValueError, httpx.InvalidURL) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(502, f"URL returned HTTP {exc.response.status_code}") from exc
+    except (httpx.HTTPError, TimeoutError) as exc:
+        raise HTTPException(502, "URL could not be fetched") from exc
+    audit(session, key, "document.ingest_url", collection_id)
+    session.commit()
+    return {"chunks": chunks, "url": body.url}
+
+
 @app.post("/v1/collections/{collection_id}/search")
 async def search_collection(collection_id: str, body: Search, session: DB, key: Key, redis: RedisDep):
     from si.agents.runtime import ProjectGateway
@@ -344,6 +398,37 @@ async def search_collection(collection_id: str, body: Search, session: DB, key: 
 @app.get("/v1/agents")
 def agents(session: DB, key: Key):
     return list_owned(session, Agent, key.project_id)
+
+
+@app.get("/v1/agents/{agent_id}")
+def get_agent(agent_id: str, session: DB, key: Key):
+    return serialize(owned(session, Agent, agent_id, key.project_id))
+
+
+@app.delete("/v1/agents/{agent_id}", status_code=204)
+def delete_agent(agent_id: str, session: DB, key: Key):
+    from si.agents import ACTIVE_RUN_STATUSES
+    item = owned(session, Agent, agent_id, key.project_id)
+    # Concurrent run inserts wait on this lock for their foreign key check, then fail.
+    session.execute(select(Agent.id).where(Agent.id == item.id).with_for_update())
+    active = session.scalar(select(func.count()).select_from(Run).where(
+        Run.agent_id == item.id, Run.status.in_(ACTIVE_RUN_STATUSES)))
+    if active:
+        raise HTTPException(409, f"Agent has {active} active run(s); cancel them first")
+    # Spans copy run transcripts, so they go with the runs they describe.
+    session.execute(delete(Span).where(
+        Span.project_id == key.project_id,
+        Span.run_id.in_(select(Run.id).where(Run.agent_id == item.id))))
+    session.execute(delete(Run).where(Run.agent_id == item.id))
+    session.delete(item)
+    audit(session, key, "agent.delete", item.id)
+    session.commit()
+
+
+@app.get("/v1/tools")
+def tools(key: Key):
+    from si.agents.tools import tool_catalog
+    return tool_catalog()
 
 
 @app.get("/v1/memory")
@@ -378,9 +463,17 @@ def check_collections(session: Session, project_id: str, ids: list[str]):
         owned(session, Collection, collection_id, project_id)
 
 
+def check_tools(names: list[str]) -> None:
+    from si.agents.tools import unknown_tools
+    unknown = unknown_tools(names)
+    if unknown:
+        raise HTTPException(422, "Unknown tools: " + ", ".join(unknown))
+
+
 @app.post("/v1/agents", status_code=201)
 def create_agent(body: AgentCreate, session: DB, key: Key):
     check_collections(session, key.project_id, body.collection_ids)
+    check_tools(body.tools)
     item = Agent(project_id=key.project_id, **body.model_dump())
     session.add(item)
     session.flush()
@@ -396,6 +489,7 @@ def update_agent(agent_id: str, body: AgentPatch, session: DB, key: Key):
     if any(value is None for value in values.values()):
         raise HTTPException(422, "Fields cannot be null")
     check_collections(session, key.project_id, values.get("collection_ids", []))
+    check_tools(values.get("tools", []))
     for name, value in values.items():
         setattr(item, name, value)
     audit(session, key, "agent.update", item.id)
@@ -422,7 +516,12 @@ async def create_run(agent_id: str, body: RunCreate, session: DB, key: Key, redi
     run = Run(project_id=key.project_id, agent_id=agent_id, input=body.input,
               session_id=body.session_id)
     session.add(run)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError as exc:
+        # The agent was deleted concurrently.
+        session.rollback()
+        raise HTTPException(404, "Resource not found") from exc
     audit(session, key, "run.create", run.id)
     session.commit()
     if body.background:
@@ -433,9 +532,60 @@ async def create_run(agent_id: str, body: RunCreate, session: DB, key: Key, redi
     return serialize(run)
 
 
+RUN_SUMMARY_COLUMNS = [column for column in Run.__table__.columns
+                       if column.name not in {"messages", "events", *INTERNAL_COLUMNS}]
+
+
+@app.get("/v1/runs")
+def runs(session: DB, key: Key, agent_id: str | None = None, status: RunStatus | None = None,
+         session_id: str | None = None, limit: Annotated[int, Query(ge=1, le=200)] = 50):
+    query = select(*RUN_SUMMARY_COLUMNS).where(Run.project_id == key.project_id)
+    if agent_id:
+        query = query.where(Run.agent_id == agent_id)
+    if status:
+        query = query.where(Run.status == status)
+    if session_id:
+        query = query.where(Run.session_id == session_id)
+    rows = session.execute(query.order_by(Run.created_at.desc(), Run.id.desc()).limit(limit))
+    return [{name: jsonable_encoder(value) for name, value in row.items()}
+            for row in rows.mappings()]
+
+
 @app.get("/v1/runs/{run_id}")
 def get_run(run_id: str, session: DB, key: Key):
     return serialize(owned(session, Run, run_id, key.project_id))
+
+
+@app.post("/v1/runs/{run_id}/cancel")
+def cancel(run_id: str, session: DB, key: Key):
+    from si.agents import RunStateError, cancel_run
+    owned(session, Run, run_id, key.project_id)
+    try:
+        run = cancel_run(session, run_id)
+    except RunStateError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    audit(session, key, "run.cancel", run_id)
+    session.commit()
+    return serialize(run)
+
+
+@app.post("/v1/runs/{run_id}/resume")
+async def resume(run_id: str, session: DB, key: Key, redis: RedisDep,
+                 body: RunResume | None = None):
+    from si.agents import RunStateError, execute_run, resume_run
+    owned(session, Run, run_id, key.project_id)
+    try:
+        run = resume_run(session, run_id)
+    except RunStateError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    audit(session, key, "run.resume", run_id)
+    session.commit()
+    if body is None or body.background:
+        await enqueue_run(run_id)
+    else:
+        await execute_run(session, run_id, redis=redis)
+    session.refresh(run)
+    return serialize(run)
 
 
 @app.get("/v1/runs/{run_id}/events")
@@ -469,11 +619,14 @@ async def run_events(run_id: str, session: DB, key: Key, request: Request):
 
 @app.post("/v1/runs/{run_id}/approve")
 async def approve(run_id: str, body: Approval, session: DB, key: Key, redis: RedisDep):
-    from si.agents import approve_run
+    from si.agents import RunStateError, approve_run
     run = owned(session, Run, run_id, key.project_id)
     if run.status != "waiting_approval":
         raise HTTPException(409, "Run is not waiting for approval")
-    await approve_run(session, run_id, body.approved, redis=redis)
+    try:
+        await approve_run(session, run_id, body.approved, redis=redis)
+    except RunStateError as exc:
+        raise HTTPException(409, str(exc)) from exc
     audit(session, key, "run.approve" if body.approved else "run.reject", run_id)
     session.commit()
     session.refresh(run)
@@ -481,10 +634,13 @@ async def approve(run_id: str, body: Approval, session: DB, key: Key, redis: Red
 
 
 @app.get("/v1/traces")
-def traces(session: DB, key: Key, run_id: str | None = None):
+def traces(session: DB, key: Key, run_id: str | None = None,
+           kind: Annotated[str | None, Query(max_length=50)] = None):
     query = select(Span).where(Span.project_id == key.project_id)
     if run_id:
         query = query.where(Span.run_id == run_id)
+    if kind:
+        query = query.where(Span.kind == kind)
     return [serialize(item) for item in session.scalars(query.order_by(Span.created_at.desc()).limit(500))]
 
 
@@ -540,7 +696,14 @@ def render_prompt(name: str, version: int, body: Render, session: DB, key: Key):
 
 @app.get("/v1/evals")
 def evals(session: DB, key: Key):
-    return list_owned(session, EvalRun, key.project_id)
+    return [serialize(item) for item in session.scalars(
+        select(EvalRun).where(EvalRun.project_id == key.project_id)
+        .order_by(EvalRun.created_at.desc().nulls_last(), EvalRun.id))]
+
+
+@app.get("/v1/evals/{eval_id}")
+def get_eval(eval_id: str, session: DB, key: Key):
+    return serialize(owned(session, EvalRun, eval_id, key.project_id))
 
 
 @app.post("/v1/evals", status_code=201)

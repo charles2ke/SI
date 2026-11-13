@@ -53,8 +53,64 @@ until an authenticated approver resumes them. Interrupted side-effecting work mu
 not be blindly replayed: inspect events before recovery. SSE reads persisted run
 events, so reconnecting clients can observe state.
 
+## Run lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued: POST /v1/agents/{id}/runs
+    queued --> running: executor claims the run
+    running --> completed
+    running --> failed
+    running --> waiting_approval: sensitive tool call
+    waiting_approval --> queued: approve or reject
+    running --> cancelling: cancel
+    cancelling --> cancelled: next checkpoint
+    queued --> cancelled: cancel
+    waiting_approval --> cancelled: cancel
+    interrupted --> cancelled: cancel
+    running --> interrupted: worker timeout or restart
+    interrupted --> queued: resume
+```
+
+- **Cancel** (`POST /v1/runs/{id}/cancel`) stops queued, waiting and interrupted
+  runs at once. A running run becomes `cancelling`; its executor checks the status
+  before each model and tool call and records `cancelled`. Calls already in flight
+  finish first, and their side effects are not undone. Repeating a cancel is
+  harmless; cancelling a `completed` or `failed` run returns 409.
+- **Interrupted** runs are never replayed automatically, because a tool may already
+  have run. A cancelled or timed-out worker job marks its run `interrupted`; a
+  starting worker does the same to `running` runs, finishes `cancelling` runs as
+  `cancelled`, and requeues `queued` ones. A starting worker can't tell orphaned
+  runs from live ones, so it also interrupts runs the API is executing inline
+  (`background: false` runs and resumes, approvals, agent evals) and, with several
+  workers, runs another worker is executing. Run a single worker.
+- **Ownership.** Each claim stamps the run with a new token. An executor writes the
+  run only while it holds the latest token and the run is `running`, or `cancelling`
+  when recording the result of a call already in flight. It checks as it commits,
+  holding the row lock on PostgreSQL. An executor whose run was interrupted, resumed
+  or claimed again therefore stops at its next write without changing the run. A call
+  it had already started still completes and appears in traces.
+- **Resume** (`POST /v1/runs/{id}/resume`) requeues only `interrupted` runs, from
+  their persisted messages. A pending sensitive tool call needs fresh approval, since
+  it may have executed before the interruption; a pending non-sensitive call runs again.
+- **Approve or reject** (`POST /v1/runs/{id}/approve`) applies only to
+  `waiting_approval` runs, once per pending call; otherwise it returns 409.
+- **Deleting** an agent also deletes its runs and their trace spans, and is refused
+  with 409 while it has queued, running, waiting or cancelling runs. Deleting a
+  collection deletes its chunks, and is refused with 409 while an agent uses it.
+
+`GET /v1/runs` lists runs newest first without transcripts or events; filter by
+`agent_id`, `status` or `session_id`. `GET /v1/tools` describes the built-in tools,
+whether each is available on this server and why not, and the configured MCP server
+prefixes. Agent definitions that name unknown tools are rejected with 422.
+`GET /v1/traces` accepts `run_id` and `kind` filters (`model`, `tool`, `gateway`,
+`embedding`, `request`). Every authenticated API call records a `request` span.
+
 Prompts are append-only versions with plain variable substitution. Evals store
-per-case actual output and scores; threshold decisions live in the CLI for CI use.
+per-case actual output and scores, plus the configuration they ran with (target,
+scorer, threshold, model and case count) and their creation time; list them with
+`GET /v1/evals`. Each case passes when its score reaches the threshold; CI gating
+on the overall score lives in the CLI, which sends its `--threshold` so both agree.
 LLM-judge scores are model-dependent, so deterministic scorers are preferred for
 regression gates. Traces are database records; an external OpenTelemetry collector
 is optional future deployment integration, not required to run the MVP.
