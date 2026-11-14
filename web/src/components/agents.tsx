@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Api, Row } from "@/lib/api";
 import { ConfirmButton, ErrorBox, Json, Notice, ResourceStatus, StatusBadge, clip, plural, rows, segment, time, useAction, useResource } from "@/components/common";
 
@@ -56,6 +56,7 @@ export function Agents({ api, onTraces }: { api: Api; onTraces: (runId: string) 
   const [pollError, setPollError] = useState("");
   const action = useAction();
   const runAction = useAction();
+  const runSelection = useRef(0);
 
   const runId = run ? String(run.id) : "";
   const runStatus = run ? String(run.status) : "";
@@ -65,18 +66,25 @@ export function Agents({ api, onTraces }: { api: Api; onTraces: (runId: string) 
   useEffect(() => {
     if (!runId || !LIVE.includes(runStatus)) return;
     const controller = new AbortController();
+    const selection = runSelection.current;
     const timer = setInterval(() => {
       void api.request(`/v1/runs/${segment(runId)}`, { signal: controller.signal }).then(value => {
+        if (selection !== runSelection.current) return;
         const next = value as Row;
         setRun(current => current?.id === next.id ? next : current);
         setPollError("");
         if (next.status !== runStatus) void refreshHistory();
-      }).catch(e => { if ((e as Error).name !== "AbortError") setPollError((e as Error).message); });
+      }).catch(e => {
+        if ((e as Error).name !== "AbortError" && selection === runSelection.current) {
+          setPollError((e as Error).message);
+        }
+      });
     }, 1500);
     return () => { clearInterval(timer); controller.abort(); };
   }, [api, runId, runStatus, refreshHistory]);
 
   function select(agent: Row | null) {
+    runSelection.current += 1;
     setId(agent ? String(agent.id) : ""); setDraft(agent ? toDraft(agent) : blank);
     setRun(null); setPollError("");
     action.setError(""); action.setNotice(""); runAction.setError(""); runAction.setNotice("");
@@ -100,22 +108,34 @@ export function Agents({ api, onTraces }: { api: Api; onTraces: (runId: string) 
     });
   }
   function start() {
+    const target = id;
+    const selection = ++runSelection.current;
     void runAction.perform(async () => {
       const body = { input, background: true, ...(session.trim() ? { session_id: session.trim() } : {}) };
-      setRun(await api.request(`/v1/agents/${segment(id)}/runs`, { method: "POST", body: JSON.stringify(body) }) as Row);
-      setPollError("");
-      void history.refresh();
+      const next = await api.request(`/v1/agents/${segment(target)}/runs`, { method: "POST", body: JSON.stringify(body) }) as Row;
+      if (selection === runSelection.current) {
+        setRun(next); setPollError("");
+        void history.refresh();
+      }
     });
   }
   function openRun(target: string) {
-    void runAction.perform(async () => { setRun(await api.request(`/v1/runs/${segment(target)}`) as Row); setPollError(""); });
+    const agent = id;
+    const selection = ++runSelection.current;
+    void runAction.perform(async () => {
+      const next = await api.request(`/v1/runs/${segment(target)}`) as Row;
+      if (selection === runSelection.current && agent === id) { setRun(next); setPollError(""); }
+    });
   }
   function act(path: string, body?: unknown) {
     const target = runId;
+    const selection = runSelection.current;
     void runAction.perform(async () => {
-      setRun(await api.request(`/v1/runs/${segment(target)}/${path}`, { method: "POST", ...(body === undefined ? {} : { body: JSON.stringify(body) }) }) as Row);
-      setPollError("");
-      void history.refresh();
+      const next = await api.request(`/v1/runs/${segment(target)}/${path}`, { method: "POST", ...(body === undefined ? {} : { body: JSON.stringify(body) }) }) as Row;
+      if (selection === runSelection.current) {
+        setRun(next); setPollError("");
+        void history.refresh();
+      }
     });
   }
 
@@ -174,7 +194,7 @@ export function Agents({ api, onTraces }: { api: Api; onTraces: (runId: string) 
           <label>Maximum steps<input type="number" min={1} max={32} required value={draft.max_steps} onChange={e => setDraft({ ...draft, max_steps: Number(e.target.value) })} /></label>
           <div className="actions">
             <button className="primary" disabled={action.busy}>{action.busy ? "Working…" : "Save agent"}</button>
-            {id && <ConfirmButton label="Delete agent" confirm="Delete agent and its runs" disabled={action.busy} onConfirm={remove} />}
+            {id && <ConfirmButton key={id} label="Delete agent" confirm="Delete agent and its runs" disabled={action.busy} onConfirm={remove} />}
           </div>
         </form>
       </div>
@@ -218,7 +238,7 @@ function RunDetail({ run, busy, onAct, onTraces }: { run: Row; busy: boolean; on
     {typeof run.output === "string" && run.output && <><h4>Output</h4><p className="output">{run.output}</p></>}
     {typeof run.error === "string" && run.error && <p className="run-error">{run.error}</p>}
     <div className="actions">
-      {CANCELLABLE.includes(status) && <ConfirmButton label="Cancel run" confirm="Yes, cancel run" disabled={busy} onConfirm={() => onAct("cancel")} />}
+      {CANCELLABLE.includes(status) && <ConfirmButton key={String(run.id)} label="Cancel run" confirm="Yes, cancel run" disabled={busy} onConfirm={() => onAct("cancel")} />}
       {status === "interrupted" && <button disabled={busy} onClick={() => onAct("resume", { background: true })}>Resume run</button>}
       <button type="button" onClick={() => onTraces(String(run.id))}>View traces ↗</button>
     </div>

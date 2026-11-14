@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { list, type Api, type Row } from "@/lib/api";
 import { ConfirmButton, ErrorBox, Notice, ResourceStatus, plural, segment, useAction, useResource } from "@/components/common";
 
@@ -14,12 +14,19 @@ export function Knowledge({ api }: { api: Api }) {
   const [query, setQuery] = useState("");
   const [limit, setLimit] = useState("5");
   const [results, setResults] = useState<Row[] | null>(null);
+  const searchRequest = useRef(0);
   const action = useAction();
   const selected = id || String(collections.rows[0]?.id || "");
+  const selectedRef = useRef(selected);
+  useEffect(() => { selectedRef.current = selected; }, [selected]);
   const collection = collections.rows.find(row => String(row.id) === selected);
   const base = `/v1/collections/${segment(selected)}`;
 
-  function choose(next: string) { setId(next); setResults(null); action.setError(""); action.setNotice(""); }
+  function choose(next: string) {
+    searchRequest.current += 1;
+    selectedRef.current = next || String(collections.rows[0]?.id || "");
+    setId(next); setResults(null); action.setError(""); action.setNotice("");
+  }
   function create() {
     void action.perform(async () => {
       const created = await api.request("/v1/collections", { method: "POST", body: JSON.stringify({ name }) }) as Row;
@@ -46,8 +53,11 @@ export function Knowledge({ api }: { api: Api }) {
     });
   }
   function search() {
+    const target = selected;
+    const request = ++searchRequest.current;
     void action.perform(async () => {
-      setResults(list(await api.request(`${base}/search`, { method: "POST", body: JSON.stringify({ query, limit: Number(limit) }) })));
+      const result = await api.request(`${base}/search`, { method: "POST", body: JSON.stringify({ query, limit: Number(limit) }) });
+      if (request === searchRequest.current && target === selectedRef.current) setResults(list(result));
     });
   }
   function remove() {
@@ -75,7 +85,7 @@ export function Knowledge({ api }: { api: Api }) {
     <div className="panel padded">
       <div className="section-heading">
         <h2>{collection ? String(collection.name) : "Explore your knowledge"}</h2>
-        {collection && <ConfirmButton label="Delete collection" confirm="Delete collection and chunks" disabled={action.busy} onConfirm={remove} />}
+        {collection && <ConfirmButton key={selected} label="Delete collection" confirm="Delete collection and chunks" disabled={action.busy} onConfirm={remove} />}
       </div>
       <ErrorBox error={action.error} /><Notice notice={action.notice} />
       {selected ? <>

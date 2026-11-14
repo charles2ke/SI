@@ -2,7 +2,7 @@ import { test, expect, type Locator, type Page } from "@playwright/test";
 import { Api, streamChat } from "../src/lib/api";
 
 type Body = Record<string, unknown> | null;
-type Handler = (path: string, method: string, body: Body, query: URLSearchParams) => unknown;
+type Handler = (path: string, method: string, body: Body, query: URLSearchParams) => unknown | Promise<unknown>;
 /** Return from a mock handler to send a non-200 response. */
 class Reply { constructor(readonly status: number, readonly body?: unknown) {} }
 
@@ -18,7 +18,7 @@ async function mock(page: Page, handler?: Handler) {
     expect(req.headers().authorization).toBe(["Bearer", "si-local-development"].join(" "));
     const url = new URL(req.url());
     const data = req.headers()["content-type"]?.includes("application/json") ? req.postDataJSON() : null;
-    const result = handler?.(url.pathname, req.method(), data, url.searchParams);
+    const result = await handler?.(url.pathname, req.method(), data, url.searchParams);
     if (result instanceof Reply) { await route.fulfill(result.body === undefined ? { status: result.status } : { status: result.status, json: result.body }); return; }
     await route.fulfill({ json: result ?? (url.pathname === "/v1/models" ? { data: [{ id: "local-model" }] } : { data: [] }) });
   });
@@ -279,6 +279,81 @@ test("manage collections, import knowledge, and search with scores", async ({ pa
   await expect(page.getByRole("status").filter({ hasText: "Collection deleted." })).toBeVisible();
   await expect(page.getByRole("button", { name: /^Research/ })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Archive", exact: true })).toBeVisible();
+});
+
+test("run details and confirmations stay bound to the selected agent and run", async ({ page }) => {
+  const agents = [
+    { id: "agent-a", name: "Agent A", system_prompt: "A", model: "local-model", tools: [], collection_ids: [], max_steps: 8 },
+    { id: "agent-b", name: "Agent B", system_prompt: "B", model: "local-model", tools: [], collection_ids: [], max_steps: 8 },
+  ];
+  const runA = { id: "run-a", input: "Run A", status: "waiting_approval", pending_tool: { name: "http_fetch", arguments: {} }, events: [] };
+  const runB = { id: "run-b", input: "Run B", status: "interrupted", events: [] };
+  let releaseA!: () => void;
+  let requestAStarted = false;
+  const delayedA = new Promise<typeof runA>(resolve => { releaseA = () => resolve(runA); });
+  await mock(page, async (path, method, _body, query) => {
+    if (path === "/v1/agents") return { data: agents };
+    if (path === "/v1/runs") return { data: query.get("agent_id") === "agent-a" ? [runA] : [runB] };
+    if (path === "/v1/runs/run-a") { requestAStarted = true; return delayedA; }
+    if (path === "/v1/runs/run-b") return runB;
+  });
+  await connect(page); await go(page, "Agents");
+  await page.getByRole("button", { name: /^Agent A/ }).click();
+  const history = page.getByRole("region", { name: "Recent runs" });
+  await history.getByRole("button", { name: /Run A/ }).click();
+  await expect.poll(() => requestAStarted).toBe(true);
+  await page.getByRole("button", { name: /^Agent B/ }).click();
+  const historyB = page.getByRole("region", { name: "Recent runs" });
+  await historyB.getByRole("button", { name: /Run B/ }).click();
+  const detail = page.getByRole("region", { name: "Selected run" });
+  await expect(detail.getByText("Run interrupted")).toBeVisible();
+  releaseA();
+  await expect(detail).toContainText("run-b");
+  await expect(detail).not.toContainText("run-a");
+
+  await page.getByRole("button", { name: "Delete agent", exact: true }).click();
+  await expect(page.getByRole("group", { name: "Delete agent" }).getByRole("button", { name: "Delete agent and its runs" })).toBeVisible();
+  await page.getByRole("button", { name: /^Agent A/ }).click();
+  await expect(page.getByRole("group", { name: "Delete agent" })).toHaveCount(0);
+
+  await page.getByRole("button", { name: /^Agent B/ }).click();
+  const historyAgain = page.getByRole("region", { name: "Recent runs" });
+  await historyAgain.getByRole("button", { name: /Run B/ }).click();
+  const selected = page.getByRole("region", { name: "Selected run" });
+  await expect(selected.getByRole("button", { name: "Cancel run", exact: true })).toBeVisible();
+  await selected.getByRole("button", { name: "Cancel run", exact: true }).click();
+  await expect(selected.getByRole("group", { name: "Cancel run" })).toBeVisible();
+  await page.getByRole("button", { name: /^Agent A/ }).click();
+  await page.getByRole("region", { name: "Recent runs" }).getByRole("button", { name: /Run A/ }).click();
+  await expect(page.getByRole("region", { name: "Selected run" }).getByRole("group", { name: "Cancel run" })).toHaveCount(0);
+});
+
+test("collection search results and delete confirmation stay bound to selection", async ({ page }) => {
+  const collections = [
+    { id: "collection-a", name: "Collection A", chunks: 1 },
+    { id: "collection-b", name: "Collection B", chunks: 1 },
+  ];
+  let releaseSearch!: () => void;
+  let searchStarted = false;
+  const delayedSearch = new Promise<unknown>(resolve => { releaseSearch = () => resolve([{ id: "a-result", text: "Result from A", score: 0.9 }]); });
+  await mock(page, async path => {
+    if (path === "/v1/collections") return { data: collections };
+    if (path === "/v1/collections/collection-a/search") { searchStarted = true; return delayedSearch; }
+    if (path.endsWith("/search")) return [{ id: "b-result", text: "Result from B", score: 0.8 }];
+  });
+  await connect(page); await go(page, "Knowledge");
+  await page.getByLabel("Search query").fill("find");
+  await page.getByRole("button", { name: "Search knowledge" }).click();
+  await expect.poll(() => searchStarted).toBe(true);
+  await page.getByRole("button", { name: /^Collection B/ }).click();
+  await expect(page.getByRole("heading", { name: "Collection B", exact: true })).toBeVisible();
+  releaseSearch();
+  await expect(page.getByRole("region", { name: "Search results" })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Delete collection", exact: true }).click();
+  await expect(page.getByRole("group", { name: "Delete collection" })).toBeVisible();
+  await page.getByRole("button", { name: /^Collection A/ }).click();
+  await expect(page.getByRole("group", { name: "Delete collection" })).toHaveCount(0);
 });
 
 test("filter traces and evaluate agents and prompts", async ({ page }, testInfo) => {

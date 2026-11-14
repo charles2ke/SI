@@ -20,14 +20,6 @@ async def execute_agent(ctx, run_id: str):
             await execute_run(session, run_id)
         except asyncio.CancelledError:
             session.rollback()
-            run = session.get(Run, run_id, with_for_update=True, populate_existing=True)
-            if run is not None and run.status == "cancelling":
-                mark_cancelled(run, "running")
-            elif run is not None and run.status in {"queued", "running"}:
-                run.status = "interrupted"
-                run.error = "Worker cancelled or timed out; inspect events before retrying"
-                append_event(run, "interrupted", run.error)
-            session.commit()
             raise
 
 

@@ -331,7 +331,11 @@ def get_collection(collection_id: str, session: DB, key: Key):
 
 @app.delete("/v1/collections/{collection_id}", status_code=204)
 def delete_collection(collection_id: str, session: DB, key: Key):
-    item = owned(session, Collection, collection_id, key.project_id)
+    item = session.scalar(select(Collection).where(
+        Collection.id == collection_id, Collection.project_id == key.project_id
+    ).with_for_update())
+    if item is None:
+        raise HTTPException(404, "Resource not found")
     users = sorted(agent.name for agent in session.scalars(
         select(Agent).where(Agent.project_id == key.project_id))
         if item.id in (agent.collection_ids or []))
@@ -460,8 +464,16 @@ def remember(body: MemoryCreate, session: DB, key: Key):
 
 
 def check_collections(session: Session, project_id: str, ids: list[str]):
-    for collection_id in ids:
-        owned(session, Collection, collection_id, project_id)
+    if not ids:
+        return
+    found = set(session.scalars(
+        select(Collection.id)
+        .where(Collection.project_id == project_id, Collection.id.in_(set(ids)))
+        .order_by(Collection.id)
+        .with_for_update()
+    ))
+    if found != set(ids):
+        raise HTTPException(404, "Resource not found")
 
 
 def check_tools(names: list[str]) -> None:

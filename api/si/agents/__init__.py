@@ -151,7 +151,12 @@ class AgentExecutor:
     def _settle(self, run_id: str, error: Exception | None = None) -> Any:
         """Record why execution stopped, unless the run was claimed again since this executor's claim."""
         self.session.rollback()
-        run = _locked_run(self.session, run_id)
+        from si.db import Run
+
+        run = self.session.get(Run, run_id, with_for_update=True, populate_existing=True)
+        if run is None:
+            self.session.rollback()
+            return None
         claim = self._claims.get(run_id)
         if claim is not None and run.claim_id == claim:
             if run.status == "cancelling":
@@ -163,6 +168,24 @@ class AgentExecutor:
         self.session.commit()
         return run
 
+    def _interrupt(self, run_id: str) -> None:
+        """Settle a cancelled worker task only while this executor still owns the run."""
+        from si.db import Run
+
+        self.session.rollback()
+        run = self.session.get(Run, run_id, with_for_update=True, populate_existing=True)
+        claim = self._claims.get(run_id)
+        if run is None or claim is None or run.claim_id != claim:
+            self.session.rollback()
+            return
+        if run.status == "cancelling":
+            mark_cancelled(run, "running")
+        elif run.status == "running":
+            run.status = "interrupted"
+            run.error = "Worker cancelled or timed out; inspect events before retrying"
+            append_event(run, "interrupted", run.error)
+        self.session.commit()
+
     def _trace(
         self, run: Any, kind: str, name: str, inputs: dict[str, Any], outputs: dict[str, Any],
         started: float, tokens: int = 0, cost: float = 0,
@@ -171,7 +194,15 @@ class AgentExecutor:
 
         Commits without an ownership check, so call it only while the run has no pending changes.
         """
-        from si.db import Span
+        from si.db import Run, Span
+
+        with self.session.no_autoflush:
+            exists = self.session.scalar(
+                select(Run.id).where(Run.id == run.id).with_for_update()
+            )
+        if exists is None:
+            self.session.rollback()
+            return
 
         self.session.add(
             Span(
@@ -399,6 +430,9 @@ class AgentExecutor:
                 return run
         except _Preempted:
             return self._settle(run_id)
+        except asyncio.CancelledError:
+            self._interrupt(run_id)
+            raise
         except Exception as exc:
             return self._settle(run_id, exc)
 

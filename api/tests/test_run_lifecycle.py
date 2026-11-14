@@ -190,6 +190,26 @@ async def test_interrupted_executor_keeps_late_result_out_of_run(database, monke
         assert session.scalar(select(func.count()).select_from(Span).where(Span.run_id == run_id)) == 1
 
 
+async def test_deleted_run_drops_late_trace_and_settlement(client, database, monkeypatch):
+    from worker.main import startup
+
+    monkeypatch.setattr("worker.main.SessionLocal", database)
+    agent_id = make_agent(database)
+    run_id = make_run(database, agent_id)
+    gateway = Blocked(response("late"))
+    with database() as session:
+        task = asyncio.create_task(AgentExecutor(session, gateway).run(run_id))
+        await gateway.entered.wait()
+        await startup({"redis": Queue()})
+        deleted = client.delete(f"/v1/agents/{agent_id}")
+        assert deleted.status_code == 204, deleted.text
+        gateway.release.set()
+        assert await task is None
+    with database() as session:
+        assert session.get(Run, run_id) is None
+        assert session.scalar(select(func.count()).select_from(Span).where(Span.run_id == run_id)) == 0
+
+
 @pytest.mark.parametrize("status", ["queued", "waiting_approval", "interrupted"])
 def test_cancel_paused_runs_immediately_and_idempotently(client, database, status):
     agent_id = make_agent(database)
@@ -325,21 +345,19 @@ def test_list_runs_filters_orders_and_omits_transcripts(client, database):
     assert client.get("/v1/runs", params={"limit": 0}).status_code == 422
 
 
-async def test_worker_timeout_finishes_requested_cancellation(database, monkeypatch):
-    from worker.main import execute_agent
-
+async def test_executor_cancellation_finishes_requested_cancellation(database):
     run_id = make_run(database, make_agent(database))
 
-    async def cancelled_mid_run(session, identity):
-        run = session.get(Run, identity)
-        run.status = "cancelling"
-        session.commit()
-        raise asyncio.CancelledError
+    class CancelledByWorker:
+        async def chat(self, request):
+            with database() as other:
+                run = other.get(Run, run_id)
+                run.status = "cancelling"
+                other.commit()
+            raise asyncio.CancelledError
 
-    monkeypatch.setattr("worker.main.SessionLocal", database)
-    monkeypatch.setattr("si.agents.execute_run", cancelled_mid_run)
-    with pytest.raises(asyncio.CancelledError):
-        await execute_agent({}, run_id)
+    with database() as session, pytest.raises(asyncio.CancelledError):
+        await AgentExecutor(session, CancelledByWorker()).run(run_id)
     with database() as session:
         run = session.get(Run, run_id)
         assert run.status == "cancelled"
