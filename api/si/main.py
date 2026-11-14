@@ -411,6 +411,7 @@ def delete_agent(agent_id: str, session: DB, key: Key):
     item = owned(session, Agent, agent_id, key.project_id)
     # Concurrent run inserts wait on this lock for their foreign key check, then fail.
     session.execute(select(Agent.id).where(Agent.id == item.id).with_for_update())
+    session.scalars(select(Run.id).where(Run.agent_id == item.id).with_for_update()).all()
     active = session.scalar(select(func.count()).select_from(Run).where(
         Run.agent_id == item.id, Run.status.in_(ACTIVE_RUN_STATUSES)))
     if active:
