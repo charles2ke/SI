@@ -199,7 +199,18 @@ async def evaluate(
         from si.agents.runtime import ProjectGateway
 
         gateway = ProjectGateway(session, project_id, redis)
-    evaluation = EvalRun(project_id=project_id, status="running", results=[], score=0)
+    evaluation = EvalRun(
+        project_id=project_id, status="running", results=[], score=0,
+        config={
+            "scorer": scorer,
+            "threshold": threshold,
+            "model": model,
+            "agent_id": agent_id,
+            "prompt_name": prompt_name,
+            "prompt_version": prompt.version if prompt else None,
+            "cases": len(dataset),
+        },
+    )
     session.add(evaluation)
     session.commit()
     scores = []
