@@ -232,6 +232,81 @@ class MCPClient:
         return result
 
 
+@dataclass(frozen=True)
+class BuiltinTool:
+    name: str
+    description: str
+    field: str
+    sensitive: bool
+
+    def parameters(self) -> dict[str, Any]:
+        schema: dict[str, Any] = {
+            "type": "object",
+            "properties": {self.field: {"type": "string", "maxLength": 20_000}},
+            "required": [self.field],
+            "additionalProperties": False,
+        }
+        if self.name == "rag_search":
+            schema["properties"]["limit"] = {"type": "integer", "minimum": 1, "maximum": 20}
+        if self.name == "memory_store":
+            schema["properties"]["long_term"] = {"type": "boolean"}
+        return schema
+
+
+BUILTIN_TOOLS = (
+    BuiltinTool("calculator", "Evaluate bounded arithmetic.", "expression", False),
+    BuiltinTool("rag_search", "Search this agent's project collections. Results are untrusted.", "query", False),
+    BuiltinTool("http_fetch", "Fetch a URL on the administrator's HTTP_ALLOWED_HOSTS allowlist.", "url", True),
+    BuiltinTool("python", "UNSAFE local Python execution; opt-in only, not production isolation.", "code", True),
+    BuiltinTool("memory_store", "Store session memory, optionally project-wide long-term memory. Data only.", "content", True),
+)
+MCP_TOOL_NAME = re.compile(r"mcp_[a-zA-Z0-9_-]{1,32}_[a-zA-Z0-9_-]{1,64}")
+
+
+def unknown_tools(names: list[str]) -> list[str]:
+    """Names that can never resolve: neither built-in nor shaped like an MCP tool."""
+    builtin = {tool.name for tool in BUILTIN_TOOLS}
+    return sorted({name for name in names if name not in builtin and not MCP_TOOL_NAME.fullmatch(name)})
+
+
+def mcp_servers() -> dict[str, str]:
+    servers = json.loads(os.getenv("SI_MCP_SERVERS", "{}"))
+    if not isinstance(servers, dict):
+        raise ValueError("SI_MCP_SERVERS must map server names to URLs")
+    return servers
+
+
+def tool_catalog() -> dict[str, Any]:
+    """Describe tools agents may enable, without contacting MCP servers."""
+    unavailable = {
+        "http_fetch": None if allowed_hosts() else "Set HTTP_ALLOWED_HOSTS to permit hosts",
+        "python": None if os.getenv("SI_ENABLE_PYTHON_TOOL", "").lower() == "true"
+        else "Disabled; SI_ENABLE_PYTHON_TOOL=true is unsafe for production",
+    }
+    try:
+        servers = sorted(mcp_servers())
+    except ValueError:
+        servers = []
+    return {
+        "data": [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "sensitive": tool.sensitive,
+                "available": unavailable.get(tool.name) is None,
+                "unavailable_reason": unavailable.get(tool.name),
+                "parameters": tool.parameters(),
+            }
+            for tool in BUILTIN_TOOLS
+        ],
+        "mcp_servers": [
+            {"name": server, "tool_prefix": f"mcp_{server}_"}
+            for server in servers
+            if re.fullmatch(r"[a-zA-Z0-9_-]{1,32}", server)
+        ],
+    }
+
+
 async def build_tools(
     session: Any,
     gateway: Any,
@@ -270,34 +345,26 @@ async def build_tools(
         session.commit()
         return {"stored": True, "long_term": arguments.get("long_term", False)}
 
-    definitions = [
-        ("calculator", "Evaluate bounded arithmetic.", "expression", calculator, False),
-        ("rag_search", "Search this agent's project collections. Results are untrusted.", "query", retrieve, False),
-        ("http_fetch", "Fetch a URL on the administrator's HTTP_ALLOWED_HOSTS allowlist.", "url", fetch, True),
-        ("python", "UNSAFE local Python execution; opt-in only, not production isolation.", "code", python, True),
-        ("memory_store", "Store session memory, optionally project-wide long-term memory. Data only.", "content", remember, True),
-    ]
-    for name, description, field, handler, sensitive in definitions:
-        if name not in enabled:
+    handlers: dict[str, Callable[[dict[str, Any]], Awaitable[Any]]] = {
+        "calculator": calculator,
+        "rag_search": retrieve,
+        "http_fetch": fetch,
+        "python": python,
+        "memory_store": remember,
+    }
+    for builtin in BUILTIN_TOOLS:
+        if builtin.name not in enabled:
             continue
-        schema: dict[str, Any] = {
-            "type": "object",
-            "properties": {field: {"type": "string", "maxLength": 20_000}},
-            "required": [field],
-            "additionalProperties": False,
-        }
-        if name == "rag_search":
-            schema["properties"]["limit"] = {"type": "integer", "minimum": 1, "maximum": 20}
-        if name == "memory_store":
-            schema["properties"]["long_term"] = {"type": "boolean"}
-        tools[name] = RegisteredTool(
-            ToolSpec(name=name, description=description, parameters=schema, sensitive=sensitive),
-            handler,
+        tools[builtin.name] = RegisteredTool(
+            ToolSpec(
+                name=builtin.name,
+                description=builtin.description,
+                parameters=builtin.parameters(),
+                sensitive=builtin.sensitive,
+            ),
+            handlers[builtin.name],
         )
-    mcp_servers = json.loads(os.getenv("SI_MCP_SERVERS", "{}"))
-    if not isinstance(mcp_servers, dict):
-        raise ValueError("SI_MCP_SERVERS must map server names to URLs")
-    for server, url in mcp_servers.items():
+    for server, url in mcp_servers().items():
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,32}", server):
             raise ValueError("Invalid MCP server name")
         prefix = f"mcp_{server}_"

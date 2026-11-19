@@ -22,12 +22,18 @@ It demonstrates tool calls and echoes/combines observations; it is **not an LLM*
 
 In the console:
 
-1. Create a knowledge collection; upload `examples/knowledge.txt`.
-2. Create an agent using `mock`, tools `rag_search` and `calculator`, and select
-   that collection.
-3. Run `What is SI? Also calculate 2 + 3.`; inspect the persisted run and traces.
-4. Run `examples/eval.json` against the agent with the `contains` scorer.
-5. Try streaming chat in the playground.
+1. In **Knowledge**, create a collection, upload `examples/knowledge.txt`, and
+   search it to see scored passages.
+2. In **Agents**, create an agent using `mock`, check the `rag_search` and
+   `calculator` tools, and select that collection.
+3. Run `What is SI? Also calculate 2 + 3.`; follow the run timeline, then choose
+   **View traces** to see that run's spans.
+4. In **Evals**, run `examples/eval.json` against the agent with the `contains` scorer.
+5. In **Prompts**, save a template such as `Answer this: {input}` and render it.
+6. Try streaming chat in the **Playground**.
+
+Runs that call a sensitive tool pause with **Approve** and **Reject** buttons.
+Active runs can be cancelled; runs interrupted by a worker failure can be resumed.
 
 Data survives restarts. `docker compose down -v` **deletes** the databases.
 Only the API and console ports are published, bound to localhost by default.
@@ -58,7 +64,7 @@ with Client() as si:  # SI_API_KEY; SI_API_URL defaults to http://localhost:8000
     )
     run = si.run_agent(agent["id"], "What is SI? Also calculate 2 + 3.")
     print(run["output"])
-    print(si.traces())
+    print(si.traces(run_id=run["id"]))
     print(si.evaluate(
         [{"input": "What is 2 + 3?", "expected": "5"}],
         scorer="contains", agent_id=agent["id"],
@@ -75,9 +81,26 @@ uv run --project sdk/python si eval run examples/eval.json \
 ```
 
 `si eval run` exits **0** at/above threshold, **1** below it, and **2** on errors.
+`si agent run` and `si run approve|reject|resume` print the run and exit **2** when
+it is waiting for approval or ended `failed`, `interrupted` or `cancelled`.
+
+```sh
+uv run --project sdk/python si tools                # built-in tools and MCP servers
+uv run --project sdk/python si run list --status waiting_approval
+uv run --project sdk/python si run approve RUN_ID   # or reject, cancel, resume, events
+uv run --project sdk/python si traces --run RUN_ID --kind tool
+uv run --project sdk/python si collection ingest-url COLLECTION_ID URL  # host must be in HTTP_ALLOWED_HOSTS
+```
+
+`si --help` and `si COMMAND --help` list every command, including `get`/`delete`
+for collections and agents, prompt `create`/`render`, and `eval list`/`get`.
+
 The agent run endpoint queues work in Redis; the separate worker executes it.
 Run events are available as SSE at `/v1/runs/{id}/events`. Sensitive tools pause
-for project-authorized approval via `/v1/runs/{id}/approve`.
+for project-authorized approval via `/v1/runs/{id}/approve`. `GET /v1/runs` lists
+runs (filter by `agent_id`, `status` or `session_id`); `POST /v1/runs/{id}/cancel`
+stops a run and `POST /v1/runs/{id}/resume` requeues an interrupted one. See the
+[run lifecycle](docs/architecture.md#run-lifecycle).
 
 ## Layers
 
@@ -85,8 +108,8 @@ for project-authorized approval via `/v1/runs/{id}/approve`.
 |---|---|---|
 | Models | `api/si/models` | Mock, OpenAI, Anthropic, Gemini, OpenAI-compatible REST adapters; policies, retries/fallback, tool calls, schemas, usage |
 | Context | `api/si/rag` | txt/md/pdf/html ingestion, overlapping chunks, 64-dimensional embeddings, vector + full-text RRF, URL connector, reranker seam |
-| Agents | `api/si/agents` | Persisted definitions, bounded tool loop, session/long-term memory, approvals, MCP client, ARQ jobs |
-| Developer tools | `sdk/python`, `web` | SDK/CLI, streaming playground, agent editor, uploads, traces, evals |
+| Agents | `api/si/agents` | Persisted definitions, tool catalog, bounded tool loop, session/long-term memory, approvals, cancel/resume, MCP client, ARQ jobs |
+| Developer tools | `sdk/python`, `web` | SDK/CLI, streaming playground, agent editor and run controls, knowledge upload/URL import/search, prompt versions, filtered traces, evals |
 | Observability | `api/si/tracing`, `api/si/evals` | Persisted spans/results, exact/contains/regex/schema/LLM-judge scorers |
 | Governance | `api/si/guardrails`, auth/quotas | Regex PII redaction, injection/block filters, hashed project keys/RBAC, audit, Redis limits/budgets/cache |
 
@@ -130,7 +153,8 @@ Provider credentials stay on the backend; the console uses only the project API 
 - **Provider:** implement the gateway's `chat`, `stream`, and `embed` contract,
   register model metadata/routing, normalize tool calls and usage, and add mocked
   HTTP contract tests. Set credentials through env, not source.
-- **Tool:** add a JSON-schema tool definition and handler to the agent tool registry.
+- **Tool:** add a `BuiltinTool` entry to `BUILTIN_TOOLS` (which `GET /v1/tools` and
+  agent validation use) and its handler in `build_tools` (`api/si/agents/tools.py`).
   Keep project scope explicit; mark side-effecting/network tools sensitive.
   Validate arguments, bound output/runtime, and test approval/resume.
 - **Scorer:** register a scorer in `api/si/evals`; return a bounded score from

@@ -3,7 +3,19 @@ from datetime import datetime, timezone
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from si.config import settings
@@ -85,6 +97,8 @@ class Run(Base, Scoped):
     messages: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     steps: Mapped[int] = mapped_column(Integer, default=0)
     pending_tool: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # Token of the latest executor claim; only that executor may update the run.
+    claim_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
@@ -114,6 +128,11 @@ class EvalRun(Base, Scoped):
     results: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     score: Mapped[float] = mapped_column(Float, default=0)
     status: Mapped[str] = mapped_column(String(30), default="running")
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default=text("'{}'"))
+    # Nullable: evaluations recorded before migration 0002 have no timestamp.
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=now
+    )
 
 
 class Audit(Base, Scoped):

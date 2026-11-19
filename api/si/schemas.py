@@ -2,6 +2,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+RunStatus = Literal[
+    "queued", "running", "waiting_approval", "cancelling",
+    "completed", "failed", "interrupted", "cancelled",
+]
+
 
 class Input(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -50,6 +55,14 @@ class RunCreate(Input):
     input: str = Field(min_length=1, max_length=100000)
     session_id: str | None = Field(default=None, max_length=200)
     background: bool = True
+
+
+class RunResume(Input):
+    background: bool = True
+
+
+class UrlIngest(Input):
+    url: str = Field(min_length=1, max_length=8192)
 
 
 class Approval(Input):

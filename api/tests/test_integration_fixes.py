@@ -61,7 +61,7 @@ def test_chat_quota_estimate_includes_tool_schema(client, monkeypatch):
     assert estimates[0] > 20 + len("hi")
 
 
-async def test_worker_cancellation_persists_interruption(database, monkeypatch):
+async def test_worker_cancellation_does_not_overwrite_replacement_claim(database, monkeypatch):
     from worker.main import execute_agent
 
     with database() as session:
@@ -74,9 +74,11 @@ async def test_worker_cancellation_persists_interruption(database, monkeypatch):
         run_id = run.id
 
     async def cancel(session, identity):
-        run = session.get(Run, identity)
-        run.status = "running"
-        session.commit()
+        with database() as other:
+            run = other.get(Run, identity)
+            run.status = "running"
+            run.claim_id = "replacement-claim"
+            other.commit()
         raise asyncio.CancelledError
 
     monkeypatch.setattr("worker.main.SessionLocal", database)
@@ -85,9 +87,8 @@ async def test_worker_cancellation_persists_interruption(database, monkeypatch):
         await execute_agent({}, run_id)
     with database() as session:
         persisted = session.get(Run, run_id)
-        assert persisted.status == "interrupted"
-        assert persisted.events[-1]["type"] == "interrupted"
-        assert "timed out" in persisted.error
+        assert (persisted.status, persisted.claim_id, persisted.events) == (
+            "running", "replacement-claim", [])
 
 
 def test_http_reads_are_rate_limited(client, redis):
